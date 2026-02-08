@@ -1,0 +1,17 @@
+{
+  "name": "@kazibee/chrome-browser",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "command": "./src/command.ts",
+  "kazibee": {
+    "permissions": "./permissions.json"
+  },
+  "dependencies": {
+    "playwright": "^1.51.1",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.8"
+  }
+}
