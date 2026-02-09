@@ -19,16 +19,140 @@ Runtime model
 - Tool ensures one persistent Chrome daemon with CDP.
 - `open` navigates using CDP (existing tab unless `newWindow` is requested).
 - Grid APIs (`gridScreenshot`, `scanZones`, `execute`) require CDP.
+- Per-call wait strategy is available on `open`, `launch`, `scanZones`, `labels`, `labelsOverview`, and `labelsInRange`:
+  - `waitUntil: "domcontentloaded" | "load" | "networkidle"`
+  - `timeoutMs: number`
+- `scanZones` accepts `coordinateSpace: "viewport" | "page"` (default: `"viewport"`).
+- `scanZones` interprets ranges from the visual grid and internally normalizes to DOM coordinates (DPR/scale aware).
+- Gemini request timeout is configurable with `requestTimeoutMs` on:
+  - `labels`, `labelsOverview`, `labelsInRange`, `labelsByZones`, `findInteractiveElement`
+- `scanZones` returns deterministic element selectors (no `kb` token system).
+- `execute` click/type/select/submit actions require `selector`.
+- `execute` `click` and `submit` also support `waitForNavigation`:
+  - `true` for default wait
+  - `{ waitUntil, timeoutMs, urlIncludes, urlMatches }` for explicit navigation checks
+- `execute` also supports explicit wait actions:
+  - `waitForLoadState` with `state: "domcontentloaded" | "load" | "networkidle"`
+  - `waitForSelector` with selector + wait state
+  - `waitForUrl` with `urlIncludes` or `urlMatches`
+- `labels` captures a full grid screenshot and requests detailed UI labeling from Gemini.
+- `labelsOverview` captures a full grid screenshot and returns a minimal overview:
+  - `regions[]` with only `gridRange` + `description`
+  - Uses full-page screenshot capture (entire scrollable page)
+  - Returns `gridSpace: "page"`
+- `labelsInRange` captures only a target grid range and requests focused Gemini labels for that zone.
+- `labels` and `labelsInRange` return `gridSpace: "viewport"`.
+- Always pass matching `coordinateSpace` into `scanZones`:
+  - from `labelsOverview` -> `coordinateSpace: "page"`
+  - from `labels` / `labelsInRange` -> `coordinateSpace: "viewport"`
+- `labelsByZones` runs `labelsInRange` for multiple ranges and returns per-zone label results.
+- `labels` requires `GEMINI_API_KEY`; if missing it throws.
+- `findInteractiveElement` captures a full grid screenshot and asks Gemini for one best matching interactive element by query.
+- `findInteractiveElement` requires `GEMINI_API_KEY`; if missing it throws.
 
 Typical intents to map
 - "start browser daemon" -> launchDaemon()
 - "open website" -> open(url)
-- "scan area" -> scanZones([{ start, end }])
-- "click/type" -> execute({ type: "click" | "type", kb, ... })
+- "open website and wait for network settle" -> open(url, { waitUntil: "networkidle", timeoutMs: 30000 })
+- "scan area" -> scanZones([{ start, end }], { waitUntil?: "domcontentloaded" | "load" | "networkidle", timeoutMs? })
+- "scan area from overview grid" -> scanZones([{ start, end }], { coordinateSpace: "page", ... })
+- "click/type" -> execute({ type: "click" | "type", selector, ... })
+- "submit form" -> execute({ type: "submit", selector })
+- "submit and wait for page change" -> execute({ type: "submit", selector, waitForNavigation: true })
+- "wait for initial page readiness" -> execute({ type: "waitForLoadState", state: "domcontentloaded" })
+- "wait for control visibility" -> execute({ type: "waitForSelector", selector, state: "visible" })
+- "analyze full page labels" -> labels({ model? })
+- "get quick page map first" -> labelsOverview({ model?, waitUntil?, timeoutMs? })
+- "analyze one area deeply" -> labelsInRange({ start, end }, { model?, detailLevel?, focus?, waitUntil?, timeoutMs? })
+- "analyze several areas deeply" -> labelsByZones([{ start, end }], { model?, detailLevel?, focus? })
+- "find logo/button by text" -> findInteractiveElement(query, { model? })
+
+Execution guidance for unfamiliar sites
+- IMPORTANT: Do not treat visual interaction as a one-shot operation.
+- IMPORTANT: If an attempt fails, retry with broader zones before giving up.
+- Do not rely on URL shortcuts as first choice.
+- Before first interaction, prefer `waitForLoadState` over fixed sleeps.
+- Refresh perception after each major action: rerun `labels` or `scanZones`.
+- Prefer staged Gemini calls for speed:
+  1) `labelsOverview()` first
+  2) `labelsInRange()` only where needed
+- Use `labels`/`findInteractiveElement` for grid hints, then `scanZones` for live selectors.
+- For searches/forms, prefer `execute({ type: "submit", selector })` on the nearest input/button/form.
+- For state changes expected to navigate, pass `waitForNavigation` to `click`/`submit` rather than polling tabs.
+- Avoid one-shot automation. Use attempt-based retries:
+  1) Try the smallest likely zone first (from `labelsOverview`).
+  2) If target not found or action fails, end that attempt.
+  3) Re-query and broaden zones incrementally (for example `A1:X2` -> `A1:AL6` -> `A1:AL10`).
+  4) Re-run `scanZones` for the new zone and retry action.
+  5) After successful navigation, run a fresh `labelsOverview` before next step.
+- If target is still missing after broader retries, fail clearly with the zones attempted.
 
 Code example
 ```ts
 await tools["chrome-browser"].launchDaemon();
-await tools["chrome-browser"].open("https://example.com");
-const zones = await tools["chrome-browser"].scanZones([{ start: "A1", end: "AL6" }]);
+await tools["chrome-browser"].open("https://example.com", { waitUntil: "domcontentloaded", timeoutMs: 30000 });
+await tools["chrome-browser"].execute({ type: "waitForLoadState", state: "domcontentloaded" });
+const overview = await tools["chrome-browser"].labelsOverview({ model: "gemini-2.5-flash" });
+const zoneAttempts = [
+  { start: "C1", end: "I2" },
+  { start: "A1", end: "AL6" },
+  { start: "A1", end: "AL10" },
+];
+let selector = "";
+for (const zone of zoneAttempts) {
+  const labels = await tools["chrome-browser"].labelsInRange(zone, {
+    model: "gemini-2.5-flash",
+    detailLevel: "high",
+    focus: "search controls",
+  });
+  const scan = await tools["chrome-browser"].scanZones([zone], {
+    waitUntil: "domcontentloaded",
+    timeoutMs: 12000,
+    coordinateSpace: overview.gridSpace,
+  });
+  const input = (scan[0]?.elements || []).find((el) => el.tag === "INPUT");
+  if (input?.selector) {
+    selector = input.selector;
+    break;
+  }
+}
+if (!selector) throw new Error("Search input not found after zone retries.");
+await tools["chrome-browser"].execute({ type: "click", selector });
+await tools["chrome-browser"].execute({ type: "type", selector, text: "obama" });
+await tools["chrome-browser"].execute({
+  type: "submit",
+  selector,
+  waitForNavigation: { timeoutMs: 12000, urlIncludes: "/search" },
+});
+const afterNav = await tools["chrome-browser"].labelsOverview({ model: "gemini-2.5-flash" });
 ```
+
+## MANDATORY: Mini-Call Mode (Kazibee)
+
+When using `kazibee exec`, follow atomic step execution only.
+
+### Hard Rules
+1. One `kazibee exec` = one step type only.
+2. Allowed step types:
+   - `observe` (overview/list/tabs)
+   - `inspect` (zone scan / detailed zone labels)
+   - `act` (single click OR single type OR single submit OR single navigate)
+   - `wait` (single wait action)
+   - `verify` (url/tabs/state check)
+3. Never combine step types in one call.
+   - Forbidden: click+type, type+submit, inspect+act, act+verify in same call.
+4. After each call, stop and report result before next call.
+5. If target not found, next call must be `inspect` with broader zone.
+6. On failure, do not switch strategy silently. Report failure and run next mini-call retry.
+7. No curl or offline fallback for browser tasks. Browser tool calls only.
+
+### Required Output After Every Call
+- Step type
+- Exact command run
+- Raw result JSON
+- 1-line interpretation
+- Next planned step (not executed yet)
+
+### Violation Handling
+If you break any rule above, stop immediately and output:
+`Violation: combined steps in one exec. Resetting to Mini-Call Mode.`

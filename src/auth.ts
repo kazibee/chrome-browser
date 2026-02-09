@@ -13,6 +13,7 @@ export interface Env {
 }
 
 export interface AuthConfig {
+  geminiApiKey?: string;
   chromePath: string;
   userDataDir?: string;
   headless: boolean;
@@ -23,6 +24,7 @@ export interface AuthConfig {
 
 export function getAuthConfig(env: Env): AuthConfig {
   return {
+    geminiApiKey: env.GEMINI_API_KEY?.trim() || undefined,
     chromePath: resolveChromePath(env.CHROME_PATH),
     userDataDir: resolveUserDataDir(env.CHROME_USER_DATA_DIR),
     headless: parseBool(env.CHROME_HEADLESS),

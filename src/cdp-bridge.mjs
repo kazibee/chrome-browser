@@ -3,7 +3,7 @@ import sharp from 'sharp';
 
 const CELL_SIZE = 100;
 const LABEL_MARGIN = 50;
-const SAMPLE_STEP = 10;
+const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 
 async function main() {
   const raw = process.argv[2];
@@ -27,7 +27,10 @@ async function main() {
 
     if (op === 'navigate') {
       const page = await getOrCreatePage(context, Boolean(payload.newWindow));
-      await page.goto(String(payload.url || ''), { waitUntil: 'domcontentloaded' });
+      await page.goto(String(payload.url || ''), {
+        waitUntil: normalizeLoadState(payload.waitUntil),
+        timeout: normalizeTimeoutMsOrUndefined(payload.timeoutMs),
+      });
       result = { ok: true };
     } else if (op === 'execute') {
       const page = await getOrCreatePage(context, false);
@@ -35,11 +38,13 @@ async function main() {
       result = { ok: true };
     } else if (op === 'scanZones') {
       const page = await getOrCreatePage(context, false);
-      const zones = await runScanZones(page, payload.zones || []);
+      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+      const zones = await runScanZones(page, payload.zones || [], normalizeCoordinateSpace(payload.coordinateSpace));
       result = { zones };
     } else if (op === 'gridScreenshot') {
       const page = await getOrCreatePage(context, false);
-      const image = await runGridScreenshot(page, payload.start, payload.end);
+      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+      const image = await runGridScreenshot(page, payload.start, payload.end, Boolean(payload.fullPage));
       result = { imageBase64: image.toString('base64') };
     } else {
       throw new Error(`Unsupported bridge op: ${String(op)}`);
@@ -63,18 +68,91 @@ async function runExecute(page, action) {
   if (!action || typeof action !== 'object') throw new Error('Missing execute action.');
 
   if (action.type === 'click') {
-    await page.click(selectorForKb(action.kb));
+    await runWithOptionalNavigation(page, action.waitForNavigation, async () => {
+      await page.click(requireSelector(action.selector));
+    });
     return;
   }
 
   if (action.type === 'type') {
-    await page.fill(selectorForKb(action.kb), '');
-    await page.type(selectorForKb(action.kb), String(action.text || ''));
+    const selector = requireSelector(action.selector);
+    await page.fill(selector, '');
+    await page.type(selector, String(action.text || ''));
     return;
   }
 
   if (action.type === 'select') {
-    await page.selectOption(selectorForKb(action.kb), String(action.value || ''));
+    await page.selectOption(requireSelector(action.selector), String(action.value || ''));
+    return;
+  }
+
+  if (action.type === 'submit') {
+    const selector = requireSelector(action.selector);
+    await runWithOptionalNavigation(page, action.waitForNavigation, async () => {
+      await page.$eval(selector, (node) => {
+        const el = node;
+        if (el instanceof HTMLFormElement) {
+          if (typeof el.requestSubmit === 'function') {
+            el.requestSubmit();
+          } else {
+            el.submit();
+          }
+          return;
+        }
+
+        const parentForm = (el instanceof HTMLElement ? el.closest('form') : null) || (el instanceof HTMLInputElement ? el.form : null);
+        if (parentForm) {
+          const submitter =
+            el instanceof HTMLButtonElement ||
+            (el instanceof HTMLInputElement && ['submit', 'image'].includes(String(el.type || '').toLowerCase()))
+              ? el
+              : undefined;
+          if (typeof parentForm.requestSubmit === 'function') {
+            parentForm.requestSubmit(submitter);
+          } else {
+            parentForm.submit();
+          }
+          return;
+        }
+
+        if (el instanceof HTMLElement) {
+          el.click();
+          return;
+        }
+
+        throw new Error('submit action target is not submittable');
+      });
+    });
+    return;
+  }
+
+  if (action.type === 'waitForLoadState') {
+    await page.waitForLoadState(normalizeLoadState(action.state), {
+      timeout: normalizeTimeoutMs(action.timeoutMs),
+    });
+    return;
+  }
+
+  if (action.type === 'waitForSelector') {
+    await page.waitForSelector(requireSelector(action.selector), {
+      state: normalizeSelectorWaitState(action.state),
+      timeout: normalizeTimeoutMs(action.timeoutMs),
+    });
+    return;
+  }
+
+  if (action.type === 'waitForUrl') {
+    const timeout = normalizeTimeoutMs(action.timeoutMs);
+    const includes = normalizeOptionalString(action.urlIncludes);
+    const matches = normalizeOptionalString(action.urlMatches);
+    if (!includes && !matches) {
+      throw new Error('waitForUrl requires urlIncludes or urlMatches.');
+    }
+    if (includes) {
+      await page.waitForURL((url) => String(url).includes(includes), { timeout, waitUntil: 'domcontentloaded' });
+      return;
+    }
+    await page.waitForURL(new RegExp(matches), { timeout, waitUntil: 'domcontentloaded' });
     return;
   }
 
@@ -86,25 +164,40 @@ async function runExecute(page, action) {
   }
 
   if (action.type === 'navigate') {
-    await page.goto(String(action.url || ''), { waitUntil: 'domcontentloaded' });
+    await page.goto(String(action.url || ''), {
+      waitUntil: normalizeLoadState(action.waitUntil),
+      timeout: normalizeTimeoutMsOrUndefined(action.timeoutMs),
+    });
     return;
   }
 
   throw new Error(`Unknown action type: ${String(action.type)}`);
 }
 
-async function runScanZones(page, zones) {
-  return Promise.all(
-    zones.map(async (zone) => {
-      const start = parseCell(zone.start);
-      const end = parseCell(zone.end);
-      const minCol = Math.min(start.col, end.col);
-      const maxCol = Math.max(start.col, end.col);
-      const minRow = Math.min(start.row, end.row);
-      const maxRow = Math.max(start.row, end.row);
+async function runScanZones(page, zones, coordinateSpace) {
+  const results = [];
+  for (const zone of zones) {
+    results.push(await runSingleZoneScanWithRetry(page, zone, coordinateSpace));
+  }
+  return results;
+}
 
+async function runSingleZoneScanWithRetry(page, zone, coordinateSpace) {
+  const start = parseCell(zone.start);
+  const end = parseCell(zone.end);
+  const minCol = Math.min(start.col, end.col);
+  const maxCol = Math.max(start.col, end.col);
+  const minRow = Math.min(start.row, end.row);
+  const maxRow = Math.max(start.row, end.row);
+  const zoneName = `${String(zone.start || '').toUpperCase()}:${String(zone.end || '').toUpperCase()}`;
+
+  const maxAttempts = 3;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await waitForStableDom(page);
       const elements = await page.evaluate(
-        ({ minCol, maxCol, minRow, maxRow, cellSize, step }) => {
+        ({ minCol, maxCol, minRow, maxRow, cellSize, coordinateSpace }) => {
           const isInteractive = (el) => {
             const tag = el.tagName;
             if (['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY'].includes(tag)) return true;
@@ -114,7 +207,8 @@ async function runScanZones(page, zones) {
             if (el.hasAttribute('contenteditable')) return true;
             const tabIndex = el.getAttribute('tabindex');
             if (tabIndex !== null && Number(tabIndex) >= 0) return true;
-            return window.getComputedStyle(el).cursor === 'pointer';
+            if (el.hasAttribute('onclick')) return true;
+            return false;
           };
 
           const getText = (el) => {
@@ -122,70 +216,149 @@ async function runScanZones(page, zones) {
             return raw.slice(0, 60);
           };
 
-          const tagToken = (el, token) => {
-            const existing = (el.getAttribute('data-kb') || '').trim();
-            const tokens = existing ? existing.split(/\s+/) : [];
-            if (!tokens.includes(token)) {
-              el.setAttribute('data-kb', existing ? `${existing} ${token}` : token);
-            }
+          const intersects = (a, b) => {
+            return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
           };
 
           const results = [];
-          const seenElements = new Set();
+          const seenSelectors = new Set();
 
-          for (let row = minRow; row <= maxRow; row += 1) {
-            for (let col = minCol; col <= maxCol; col += 1) {
-              const cellName = `${toColLabel(col)}${row + 1}`;
-              const foundInCell = [];
+          const dpr = Math.max(0.01, Number(window.devicePixelRatio) || 1);
+          const cssSpaceWidth = coordinateSpace === 'page'
+            ? Math.max(1, Number(document.documentElement.scrollWidth) || 1)
+            : Math.max(1, Number(window.innerWidth) || 1);
+          const cssSpaceHeight = coordinateSpace === 'page'
+            ? Math.max(1, Number(document.documentElement.scrollHeight) || 1)
+            : Math.max(1, Number(window.innerHeight) || 1);
 
-              const cellLeft = col * cellSize;
-              const cellRight = (col + 1) * cellSize;
-              const cellTop = row * cellSize;
-              const cellBottom = (row + 1) * cellSize;
+          // The visual grid is drawn on screenshot image pixels. Convert those zone bounds
+          // back into CSS-pixel coordinates before intersecting DOM rects.
+          const imageSpaceWidth = Math.max(1, cssSpaceWidth * dpr);
+          const imageSpaceHeight = Math.max(1, cssSpaceHeight * dpr);
+          const scaleX = imageSpaceWidth / cssSpaceWidth;
+          const scaleY = imageSpaceHeight / cssSpaceHeight;
 
-              for (let x = cellLeft + 1; x < cellRight; x += step) {
-                if (x >= window.innerWidth) break;
-                for (let y = cellTop + 1; y < cellBottom; y += step) {
-                  if (y >= window.innerHeight) break;
-                  let node = document.elementFromPoint(x, y);
-                  while (node) {
-                    if (isInteractive(node) && !foundInCell.includes(node)) {
-                      foundInCell.push(node);
-                    }
-                    node = node.parentElement;
+          const zoneRectImage = {
+            left: minCol * cellSize,
+            right: (maxCol + 1) * cellSize,
+            top: minRow * cellSize,
+            bottom: (maxRow + 1) * cellSize,
+          };
+          const zoneRect = {
+            left: zoneRectImage.left / scaleX,
+            right: zoneRectImage.right / scaleX,
+            top: zoneRectImage.top / scaleY,
+            bottom: zoneRectImage.bottom / scaleY,
+          };
+
+          const candidates = new Set();
+          const interactiveQuery =
+            'a[href],button,input,select,textarea,summary,[role],[tabindex],[contenteditable],[onclick]';
+          document.querySelectorAll(interactiveQuery).forEach((el) => candidates.add(el));
+
+          const pointerCandidates = document.querySelectorAll('[style*="cursor: pointer"],[style*="cursor:pointer"]');
+          pointerCandidates.forEach((el) => candidates.add(el));
+
+          candidates.forEach((el) => {
+            if (!(el instanceof HTMLElement)) return;
+            if (!isInteractive(el)) return;
+
+            const rect = el.getBoundingClientRect();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return;
+
+            const rectInSpace =
+              coordinateSpace === 'page'
+                ? {
+                    left: rect.left + window.scrollX,
+                    right: rect.right + window.scrollX,
+                    top: rect.top + window.scrollY,
+                    bottom: rect.bottom + window.scrollY,
                   }
-                }
-              }
+                : {
+                    left: rect.left,
+                    right: rect.right,
+                    top: rect.top,
+                    bottom: rect.bottom,
+                  };
 
-              foundInCell.forEach((el, idx) => {
-                const token = `${cellName}:${idx}`;
-                tagToken(el, token);
-                if (seenElements.has(el)) return;
-                seenElements.add(el);
+            if (!intersects(zoneRect, rectInSpace)) return;
 
-                results.push({
-                  kb: token,
-                  tag: el.tagName,
-                  text: getText(el),
-                  placeholder: el.placeholder || undefined,
-                  type: el.type || undefined,
-                  role: el.getAttribute('role') || undefined,
-                  label: el.getAttribute('aria-label') || undefined,
-                });
-              });
-            }
-          }
+            const selector = buildSelector(el);
+            if (!selector || seenSelectors.has(selector)) return;
+            seenSelectors.add(selector);
+
+            results.push({
+              selector,
+              tag: el.tagName,
+              text: getText(el),
+              href: el.tagName === 'A' ? el.href || undefined : undefined,
+              placeholder: el.placeholder || undefined,
+              type: el.type || undefined,
+              role: el.getAttribute('role') || undefined,
+              label: el.getAttribute('aria-label') || undefined,
+            });
+          });
+
+          results.sort((a, b) => {
+            const aText = (a.text || '').toLowerCase();
+            const bText = (b.text || '').toLowerCase();
+            if (aText && bText) return aText.localeCompare(bText);
+            if (aText) return -1;
+            if (bText) return 1;
+            return a.selector.localeCompare(b.selector);
+          });
 
           return results;
 
-          function toColLabel(index) {
-            let i = index;
-            let label = '';
-            while (i >= 0) {
-              label = String.fromCharCode(65 + (i % 26)) + label;
-              i = Math.floor(i / 26) - 1;
+          function buildSelector(el) {
+            const anchor = findAnchor(el);
+            const segments = [];
+            let node = el;
+            while (node && node !== anchor) {
+              segments.unshift(segmentForNode(node));
+              node = node.parentElement;
             }
-            return label;
+
+            if (!anchor) {
+              return segments.join(' > ');
+            }
+
+            const anchorSegment = segmentForAnchor(anchor);
+            return [anchorSegment, ...segments].join(' > ');
+          }
+
+          function findAnchor(el) {
+            let node = el;
+            while (node && node.tagName) {
+              if (node.id) return node;
+              if (node.tagName.toLowerCase() === 'html') return node;
+              node = node.parentElement;
+            }
+            return null;
+          }
+
+          function segmentForAnchor(el) {
+            const tag = el.tagName.toLowerCase();
+            if (el.id) return `${tag}#${escapeCss(el.id)}`;
+            return tag;
+          }
+
+          function segmentForNode(el) {
+            const tag = el.tagName.toLowerCase();
+            const parent = el.parentElement;
+            if (!parent) return tag;
+
+            const sameTagSiblings = Array.from(parent.children).filter((child) => child.tagName === el.tagName);
+            if (sameTagSiblings.length <= 1) return tag;
+            const position = sameTagSiblings.indexOf(el) + 1;
+            return `${tag}:nth-of-type(${position})`;
+          }
+
+          function escapeCss(value) {
+            if (window.CSS && typeof window.CSS.escape === 'function') {
+              return window.CSS.escape(String(value));
+            }
+            return String(value).replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);
           }
         },
         {
@@ -194,20 +367,51 @@ async function runScanZones(page, zones) {
           minRow,
           maxRow,
           cellSize: CELL_SIZE,
-          step: SAMPLE_STEP,
+          coordinateSpace,
         },
       );
 
       return {
-        zone: `${String(zone.start || '').toUpperCase()}:${String(zone.end || '').toUpperCase()}`,
+        zone: zoneName,
         elements,
       };
-    }),
+    } catch (error) {
+      if (!isRecoverableScanError(error) || attempt >= maxAttempts) {
+        throw error;
+      }
+      lastError = error;
+      await waitForStableDom(page);
+      await sleep(200 * attempt);
+    }
+  }
+
+  throw lastError || new Error(`Failed to scan zone ${zoneName}.`);
+}
+
+function isRecoverableScanError(error) {
+  const message = String(error && error.message ? error.message : error);
+  return (
+    message.includes('Execution context was destroyed') ||
+    message.includes('Cannot find context with specified id') ||
+    message.includes('Frame was detached') ||
+    message.includes('Target page, context or browser has been closed')
   );
 }
 
-async function runGridScreenshot(page, start, end) {
-  const screenshotBuffer = await page.screenshot({ type: 'png' });
+async function waitForStableDom(page) {
+  try {
+    await page.waitForLoadState('domcontentloaded', { timeout: 3000 });
+  } catch {
+    // Ignore and proceed; some pages stream updates continuously.
+  }
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runGridScreenshot(page, start, end, fullPage = false) {
+  const screenshotBuffer = await page.screenshot({ type: 'png', fullPage, scale: 'device' });
   const metadata = await sharp(screenshotBuffer).metadata();
   const width = metadata.width || 0;
   const height = metadata.height || 0;
@@ -351,10 +555,83 @@ function buildGridOverlaySvg({ contentWidth, contentHeight, cols, rows, colOffse
   return svg;
 }
 
-function selectorForKb(kb) {
-  const token = String(kb || '').trim();
-  if (!token) throw new Error('kb token is required.');
-  return `[data-kb~="${token.replace(/(["\\])/g, '\\$1')}"]`;
+function requireSelector(value) {
+  const selector = String(value || '').trim();
+  if (!selector) throw new Error('selector is required.');
+  return selector;
+}
+
+async function runWithOptionalNavigation(page, waitForNavigation, trigger) {
+  const waitConfig = normalizeNavigationWait(waitForNavigation);
+  if (!waitConfig) {
+    await trigger();
+    return;
+  }
+
+  const timeout = waitConfig.timeoutMs;
+  const waitUntil = normalizeLoadState(waitConfig.waitUntil);
+  const waitPromise = waitConfig.urlIncludes
+    ? page.waitForURL((url) => String(url).includes(waitConfig.urlIncludes), { timeout, waitUntil })
+    : waitConfig.urlMatches
+      ? page.waitForURL(new RegExp(waitConfig.urlMatches), { timeout, waitUntil })
+      : page.waitForNavigation({ waitUntil, timeout });
+
+  await Promise.all([waitPromise, trigger()]);
+}
+
+function normalizeNavigationWait(value) {
+  if (!value) return null;
+  if (value === true) return { timeoutMs: DEFAULT_WAIT_TIMEOUT_MS, waitUntil: 'domcontentloaded' };
+
+  const timeoutMs = Number(value.timeoutMs);
+  return {
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_WAIT_TIMEOUT_MS,
+    waitUntil: normalizeLoadState(value.waitUntil),
+    urlIncludes: typeof value.urlIncludes === 'string' && value.urlIncludes.trim() ? value.urlIncludes.trim() : undefined,
+    urlMatches: typeof value.urlMatches === 'string' && value.urlMatches.trim() ? value.urlMatches.trim() : undefined,
+  };
+}
+
+async function waitForOptionalLoadState(page, waitUntil, timeoutMs) {
+  if (waitUntil === undefined && timeoutMs === undefined) return;
+  await page.waitForLoadState(normalizeLoadState(waitUntil), {
+    timeout: normalizeTimeoutMs(timeoutMs),
+  });
+}
+
+function normalizeTimeoutMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_WAIT_TIMEOUT_MS;
+  return parsed;
+}
+
+function normalizeTimeoutMsOrUndefined(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed;
+}
+
+function normalizeLoadState(value) {
+  const state = String(value || '').toLowerCase();
+  if (state === 'load' || state === 'networkidle') return state;
+  return 'domcontentloaded';
+}
+
+function normalizeSelectorWaitState(value) {
+  const state = String(value || '').toLowerCase();
+  if (state === 'attached' || state === 'detached' || state === 'hidden') return state;
+  return 'visible';
+}
+
+function normalizeOptionalString(value) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function normalizeCoordinateSpace(value) {
+  const mode = String(value || '').toLowerCase();
+  return mode === 'page' ? 'page' : 'viewport';
 }
 
 function colLabel(index) {

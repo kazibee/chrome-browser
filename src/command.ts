@@ -77,6 +77,51 @@ export async function screenshot(first?: string | string[], ...rest: string[]) {
   } as CommandResult<typeof result>;
 }
 
+export async function labels(first?: string | string[], ...rest: string[]) {
+  const args = normalizeArgs(first, rest);
+  const [model] = args;
+  const client = main(process.env as Env);
+  const result = await client.labels(model ? { model } : undefined);
+
+  return {
+    ok: true,
+    result,
+  } as CommandResult<typeof result>;
+}
+
+export async function find(first?: string | string[], ...rest: string[]) {
+  const args = normalizeArgs(first, rest);
+  if (!args.length) {
+    throw new Error('Usage: kazibee chrome-browser find <query> [--model <model>]');
+  }
+
+  let model: string | undefined;
+  const queryParts: string[] = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (token === '--model') {
+      model = args[i + 1];
+      i += 1;
+      continue;
+    }
+    queryParts.push(token);
+  }
+
+  const query = queryParts.join(' ').trim();
+  if (!query) {
+    throw new Error('Usage: kazibee chrome-browser find <query> [--model <model>]');
+  }
+
+  const client = main(process.env as Env);
+  const result = await client.findInteractiveElement(query, model ? { model } : undefined);
+
+  return {
+    ok: true,
+    result,
+  } as CommandResult<typeof result>;
+}
+
 export async function help(): Promise<CommandHelp> {
   return {
     ok: true,
@@ -86,6 +131,8 @@ export async function help(): Promise<CommandHelp> {
       'kazibee chrome-browser open <url> [--new-window]',
       'kazibee chrome-browser tabs',
       'kazibee chrome-browser screenshot <outputPath> [startCell endCell]',
+      'kazibee chrome-browser labels [model]',
+      'kazibee chrome-browser find <query> [--model <model>]',
       'All browser operations are CDP-backed; no non-CDP mode is supported.',
     ],
   };
