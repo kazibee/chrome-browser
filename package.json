@@ -5,9 +5,14 @@
   "main": "./src/index.ts",
   "command": "./src/command.ts",
   "kazibee": {
+    "description": "Chrome browser automation client with AI-powered UI navigation and element discovery.",
     "permissions": "./permissions.json"
   },
+  "scripts": {
+    "build": "echo 'No build required - this is a Bun project with TypeScript sources'"
+  },
   "dependencies": {
+    "cheerio": "^1.2.0",
     "playwright": "^1.51.1",
     "sharp": "^0.33.5"
   },

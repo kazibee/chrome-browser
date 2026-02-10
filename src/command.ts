@@ -77,6 +77,23 @@ export async function screenshot(first?: string | string[], ...rest: string[]) {
   } as CommandResult<typeof result>;
 }
 
+export async function view(first?: string | string[], ...rest: string[]) {
+  const args = normalizeArgs(first, rest);
+  const [outputPath, start, end] = args;
+  if (!outputPath) {
+    throw new Error('Usage: kazibee chrome-browser view <outputPath> [startCell endCell]');
+  }
+
+  const client = main(process.env as Env);
+  const result =
+    start && end ? await client.saveScreenshot(outputPath, { start, end }) : await client.saveScreenshot(outputPath);
+
+  return {
+    ok: true,
+    result,
+  } as CommandResult<typeof result>;
+}
+
 export async function labels(first?: string | string[], ...rest: string[]) {
   const args = normalizeArgs(first, rest);
   const [model] = args;
@@ -131,6 +148,7 @@ export async function help(): Promise<CommandHelp> {
       'kazibee chrome-browser open <url> [--new-window]',
       'kazibee chrome-browser tabs',
       'kazibee chrome-browser screenshot <outputPath> [startCell endCell]',
+      'kazibee chrome-browser view <outputPath> [startCell endCell]',
       'kazibee chrome-browser labels [model]',
       'kazibee chrome-browser find <query> [--model <model>]',
       'All browser operations are CDP-backed; no non-CDP mode is supported.',

@@ -41,6 +41,38 @@ export type {
   ZoneResult,
 } from './chrome-client';
 
+export type {
+  Target,
+  TargetBySelector,
+  TargetByRole,
+  TargetByLabel,
+  TargetByText,
+  TargetByPoint,
+  Verify,
+  VerifyUrlContains,
+  VerifyUrlMatches,
+  VerifyTextAppears,
+  VerifySelectorGone,
+  VerifySelectorAppears,
+  VerifyAriaState,
+  VerifyCustom,
+  Resilience,
+  RetryDelayStrategy,
+  RetryDelayFixed,
+  RetryDelayLinear,
+  RetryDelayExponential,
+  ActionResult,
+  ActionFindResult,
+  VerificationResult,
+  ActionError,
+  ErrorTier,
+  ErrorCode,
+  AtomicClickOptions,
+  AtomicTypeOptions,
+  AtomicSelectOptions,
+  AtomicSubmitOptions,
+} from './resilience-types';
+
 export default function main(env: Env = {}) {
   const config = getAuthConfig(env);
   return createChromeBrowserClient(config);

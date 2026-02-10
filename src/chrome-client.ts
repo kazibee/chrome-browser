@@ -3,6 +3,21 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthConfig } from './auth';
+import type {
+  Target,
+  Verify,
+  Resilience,
+  ActionResult,
+  ActionError,
+  ErrorTier,
+  ErrorCode,
+  ActionFindResult,
+  VerificationResult,
+  AtomicClickOptions,
+  AtomicTypeOptions,
+  AtomicSelectOptions,
+  AtomicSubmitOptions,
+} from './resilience-types';
 
 const CDP_WAIT_TIMEOUT_MS = 8_000;
 const BRIDGE_TIMEOUT_MS = 120_000;
@@ -538,6 +553,30 @@ export function createChromeBrowserClient(config: AuthConfig) {
      */
     findAndSelect: async (find: FindQuery, value: string, options?: FindAndSelectOptions): Promise<FindAndActResult> =>
       findAndSelect(config, find, value, options),
+    /**
+     * Resilient click with composable Target + Verify + Resilience.
+     * Performs find-and-click in a single bridge invocation with configurable
+     * retry orchestration, coordinate fallback, and post-action verification.
+     */
+    atomicClick: async (options: AtomicClickOptions): Promise<ActionResult> => atomicClick(config, options),
+    /**
+     * Resilient type with composable Target + Verify + Resilience.
+     * Performs find-and-type in a single bridge invocation using native value
+     * setters (React-safe) with configurable retry and verification.
+     */
+    atomicType: async (options: AtomicTypeOptions): Promise<ActionResult> => atomicType(config, options),
+    /**
+     * Resilient select with composable Target + Verify + Resilience.
+     * Performs find-and-select in a single bridge invocation with configurable
+     * retry orchestration and post-action verification.
+     */
+    atomicSelect: async (options: AtomicSelectOptions): Promise<ActionResult> => atomicSelect(config, options),
+    /**
+     * Resilient form submission with composable Target + Verify + Resilience.
+     * Finds the submit target and clicks it atomically. Uses findAndClick
+     * bridge op internally. Supports coordinate fallback and verification.
+     */
+    atomicSubmit: async (options: AtomicSubmitOptions): Promise<ActionResult> => atomicSubmit(config, options),
   };
 }
 
@@ -1761,6 +1800,473 @@ async function runBridge(config: AuthConfig, payload: Record<string, unknown>): 
       });
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Resilience helpers — error classification, retry logic, target conversion
+// ---------------------------------------------------------------------------
+
+const ERROR_PATTERNS: Array<{ pattern: RegExp; tier: ErrorTier; code: ErrorCode; message: string }> = [
+  // Tier A — Transient
+  { pattern: /Execution context was destroyed|Cannot find context with specified id/i, tier: 'A', code: 'CONTEXT_DESTROYED', message: 'Execution context was destroyed' },
+  { pattern: /Frame was detached|frame was detached/i, tier: 'A', code: 'FRAME_DETACHED', message: 'Frame was detached' },
+  { pattern: /Target page, context or browser has been closed|[Bb]rowser has been closed/i, tier: 'A', code: 'BROWSER_CLOSED', message: 'Browser or context has been closed' },
+  // Tier B — Stale
+  { pattern: /is not attached to the DOM/i, tier: 'B', code: 'ELEMENT_DETACHED', message: 'Element is not attached to the DOM' },
+  { pattern: /[Ee]lement is not visible/i, tier: 'B', code: 'ELEMENT_NOT_VISIBLE', message: 'Element is not visible' },
+  { pattern: /[Ee]lement is not interactable|intercepts pointer events|Element is outside of the viewport/i, tier: 'B', code: 'ELEMENT_NOT_INTERACTABLE', message: 'Element is not interactable' },
+  // Tier C — Navigation
+  { pattern: /[Nn]avigation interrupted|Navigating frame was detached/i, tier: 'C', code: 'PAGE_NAVIGATED', message: 'Navigation interrupted the operation' },
+  { pattern: /[Cc]ross-origin/i, tier: 'C', code: 'CROSS_ORIGIN_NAVIGATION', message: 'Cross-origin navigation occurred' },
+  // Tier D — Permanent
+  { pattern: /[Tt]imeout/i, tier: 'D', code: 'TIMEOUT', message: 'Operation timed out' },
+  { pattern: /is not a valid selector|Failed to execute 'querySelector'/i, tier: 'D', code: 'SELECTOR_INVALID', message: 'Invalid selector' },
+  { pattern: /[Nn]o node found for selector|[Nn]o element found/i, tier: 'D', code: 'ELEMENT_NOT_FOUND', message: 'Element not found' },
+];
+
+function classifyError(error: unknown): ActionError {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+
+  for (const entry of ERROR_PATTERNS) {
+    if (entry.pattern.test(rawMessage)) {
+      return {
+        tier: entry.tier,
+        code: entry.code,
+        message: entry.message,
+        rawMessage,
+        retryable: entry.tier === 'A' || entry.tier === 'B',
+      };
+    }
+  }
+
+  return {
+    tier: 'D',
+    code: 'UNKNOWN',
+    message: rawMessage,
+    rawMessage,
+    retryable: false,
+  };
+}
+
+function shouldRetry(error: ActionError, resilience: Resilience, attempt: number): boolean {
+  if (!error.retryable) return false;
+  const maxAttempts = Math.max(1, resilience.retries ?? 1);
+  return attempt < maxAttempts;
+}
+
+function computeRetryDelay(resilience: Resilience, attempt: number): number {
+  const strategy = resilience.retryDelay;
+  if (!strategy) return 0;
+
+  switch (strategy.type) {
+    case 'fixed':
+      return strategy.delayMs;
+    case 'linear':
+      return strategy.baseMs * attempt;
+    case 'exponential': {
+      const delay = strategy.baseMs * Math.pow(2, attempt - 1);
+      return strategy.maxMs != null ? Math.min(delay, strategy.maxMs) : delay;
+    }
+    default:
+      return 0;
+  }
+}
+
+function targetToBridgePayload(target: Target): Record<string, unknown> {
+  switch (target.by) {
+    case 'selector':
+      return {
+        mode: 'selector',
+        query: target.selector,
+        waitFor: target.waitFor,
+        state: target.state,
+      };
+    case 'role':
+      return {
+        mode: 'role',
+        query: target.role,
+        options: {
+          name: target.name,
+          state: target.ariaState,
+        },
+      };
+    case 'label':
+      return {
+        mode: 'label',
+        query: target.labelText instanceof RegExp ? target.labelText.source : target.labelText,
+        options: {
+          isRegex: target.labelText instanceof RegExp,
+          exact: target.exact,
+          caseSensitive: target.caseSensitive,
+        },
+      };
+    case 'text':
+      return {
+        mode: 'text',
+        query: target.text instanceof RegExp ? target.text.source : target.text,
+        options: {
+          tag: target.tag,
+          isRegex: target.text instanceof RegExp,
+          exact: target.exact,
+          caseSensitive: target.caseSensitive,
+        },
+      };
+    case 'point':
+      return {
+        pointX: target.x,
+        pointY: target.y,
+      };
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Maps a bridge result object to ActionFindResult. */
+function toBridgeFindResult(element: Record<string, unknown> | null): ActionFindResult | undefined {
+  if (!element) return undefined;
+  return {
+    selector: String(element.selector ?? ''),
+    tag: String(element.tag ?? ''),
+    text: String(element.text ?? ''),
+    boundingBox: element.boundingBox as ActionFindResult['boundingBox'],
+    gridRange: element.gridRange as ActionFindResult['gridRange'],
+  };
+}
+
+/** Maps a bridge error object to ActionError (bridge already classifies errors). */
+function toBridgeActionError(error: Record<string, unknown> | undefined): ActionError | undefined {
+  if (!error) return undefined;
+  return {
+    tier: (error.tier as ErrorTier) ?? 'D',
+    code: (error.code as ErrorCode) ?? 'UNKNOWN',
+    message: String(error.message ?? ''),
+    rawMessage: String(error.rawMessage ?? error.message ?? ''),
+    retryable: Boolean(error.retryable),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Atomic action implementations
+// ---------------------------------------------------------------------------
+
+async function atomicClick(config: AuthConfig, options: AtomicClickOptions): Promise<ActionResult> {
+  const startTime = Date.now();
+  const resilience = options.resilience ?? {};
+  const maxAttempts = Math.max(1, resilience.retries ?? 1);
+  const overallTimeoutMs = resilience.timeoutMs ?? 0;
+  let lastError: ActionError | undefined;
+  let lastFindResult: ActionFindResult | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (overallTimeoutMs > 0 && Date.now() - startTime >= overallTimeoutMs) {
+      lastError = { tier: 'D', code: 'TIMEOUT', message: `Overall timeout of ${overallTimeoutMs}ms exceeded`, rawMessage: '', retryable: false };
+      break;
+    }
+    await launchDaemon(config);
+
+    if (resilience.waitForStable) {
+      await runBridge(config, {
+        op: 'execute',
+        action: {
+          type: 'waitForStable' as const,
+          stabilityWindowMs: resilience.stabilityWindowMs,
+        },
+      });
+    }
+
+    const findPayload = targetToBridgePayload(options.target);
+    const bridgeResult = await runBridge(config, {
+      op: 'findAndClick',
+      find: findPayload,
+      coordinateFallback: resilience.coordinateFallback ?? false,
+    });
+
+    const ok = Boolean(bridgeResult.ok);
+    const findResult = toBridgeFindResult(bridgeResult.element as Record<string, unknown> | null);
+    const coordinatesUsed = bridgeResult.coordinatesUsed as ActionResult['coordinatesUsed'];
+    lastFindResult = findResult ?? lastFindResult;
+
+    if (ok) {
+      let verification: VerificationResult | undefined;
+      if (options.verify) {
+        const verifyResult = await runBridge(config, {
+          op: 'verify',
+          check: options.verify,
+        });
+        verification = {
+          passed: Boolean(verifyResult.passed),
+          message: String(verifyResult.message ?? ''),
+          durationMs: Number(verifyResult.durationMs ?? 0),
+        };
+      }
+
+      return {
+        ok: true,
+        attempts: attempt,
+        durationMs: Date.now() - startTime,
+        findResult,
+        coordinatesUsed,
+        verification,
+      };
+    }
+
+    const actionError = toBridgeActionError(bridgeResult.error as Record<string, unknown> | undefined)
+      ?? classifyError(bridgeResult.error ?? 'Unknown bridge error');
+    lastError = actionError;
+
+    if (!shouldRetry(actionError, resilience, attempt)) break;
+
+    const delay = computeRetryDelay(resilience, attempt);
+    if (delay > 0) await sleep(delay);
+  }
+
+  return {
+    ok: false,
+    attempts: maxAttempts,
+    durationMs: Date.now() - startTime,
+    findResult: lastFindResult,
+    error: lastError,
+  };
+}
+
+async function atomicType(config: AuthConfig, options: AtomicTypeOptions): Promise<ActionResult> {
+  const startTime = Date.now();
+  const resilience = options.resilience ?? {};
+  const maxAttempts = Math.max(1, resilience.retries ?? 1);
+  const overallTimeoutMs = resilience.timeoutMs ?? 0;
+  let lastError: ActionError | undefined;
+  let lastFindResult: ActionFindResult | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (overallTimeoutMs > 0 && Date.now() - startTime >= overallTimeoutMs) {
+      lastError = { tier: 'D', code: 'TIMEOUT', message: `Overall timeout of ${overallTimeoutMs}ms exceeded`, rawMessage: '', retryable: false };
+      break;
+    }
+    await launchDaemon(config);
+
+    if (resilience.waitForStable) {
+      await runBridge(config, {
+        op: 'execute',
+        action: {
+          type: 'waitForStable' as const,
+          stabilityWindowMs: resilience.stabilityWindowMs,
+        },
+      });
+    }
+
+    const findPayload = targetToBridgePayload(options.target);
+    const bridgeResult = await runBridge(config, {
+      op: 'findAndType',
+      find: findPayload,
+      text: options.text,
+    });
+
+    const ok = Boolean(bridgeResult.ok);
+    const findResult = toBridgeFindResult(bridgeResult.element as Record<string, unknown> | null);
+    lastFindResult = findResult ?? lastFindResult;
+
+    if (ok) {
+      let verification: VerificationResult | undefined;
+      if (options.verify) {
+        const verifyResult = await runBridge(config, {
+          op: 'verify',
+          check: options.verify,
+        });
+        verification = {
+          passed: Boolean(verifyResult.passed),
+          message: String(verifyResult.message ?? ''),
+          durationMs: Number(verifyResult.durationMs ?? 0),
+        };
+      }
+
+      return {
+        ok: true,
+        attempts: attempt,
+        durationMs: Date.now() - startTime,
+        findResult,
+        verification,
+      };
+    }
+
+    const actionError = toBridgeActionError(bridgeResult.error as Record<string, unknown> | undefined)
+      ?? classifyError(bridgeResult.error ?? 'Unknown bridge error');
+    lastError = actionError;
+
+    if (!shouldRetry(actionError, resilience, attempt)) break;
+
+    const delay = computeRetryDelay(resilience, attempt);
+    if (delay > 0) await sleep(delay);
+  }
+
+  return {
+    ok: false,
+    attempts: maxAttempts,
+    durationMs: Date.now() - startTime,
+    findResult: lastFindResult,
+    error: lastError,
+  };
+}
+
+async function atomicSelect(config: AuthConfig, options: AtomicSelectOptions): Promise<ActionResult> {
+  const startTime = Date.now();
+  const resilience = options.resilience ?? {};
+  const maxAttempts = Math.max(1, resilience.retries ?? 1);
+  const overallTimeoutMs = resilience.timeoutMs ?? 0;
+  let lastError: ActionError | undefined;
+  let lastFindResult: ActionFindResult | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (overallTimeoutMs > 0 && Date.now() - startTime >= overallTimeoutMs) {
+      lastError = { tier: 'D', code: 'TIMEOUT', message: `Overall timeout of ${overallTimeoutMs}ms exceeded`, rawMessage: '', retryable: false };
+      break;
+    }
+    await launchDaemon(config);
+
+    if (resilience.waitForStable) {
+      await runBridge(config, {
+        op: 'execute',
+        action: {
+          type: 'waitForStable' as const,
+          stabilityWindowMs: resilience.stabilityWindowMs,
+        },
+      });
+    }
+
+    const findPayload = targetToBridgePayload(options.target);
+    const bridgeResult = await runBridge(config, {
+      op: 'findAndSelect',
+      find: findPayload,
+      value: options.value,
+    });
+
+    const ok = Boolean(bridgeResult.ok);
+    const findResult = toBridgeFindResult(bridgeResult.element as Record<string, unknown> | null);
+    lastFindResult = findResult ?? lastFindResult;
+
+    if (ok) {
+      let verification: VerificationResult | undefined;
+      if (options.verify) {
+        const verifyResult = await runBridge(config, {
+          op: 'verify',
+          check: options.verify,
+        });
+        verification = {
+          passed: Boolean(verifyResult.passed),
+          message: String(verifyResult.message ?? ''),
+          durationMs: Number(verifyResult.durationMs ?? 0),
+        };
+      }
+
+      return {
+        ok: true,
+        attempts: attempt,
+        durationMs: Date.now() - startTime,
+        findResult,
+        verification,
+      };
+    }
+
+    const actionError = toBridgeActionError(bridgeResult.error as Record<string, unknown> | undefined)
+      ?? classifyError(bridgeResult.error ?? 'Unknown bridge error');
+    lastError = actionError;
+
+    if (!shouldRetry(actionError, resilience, attempt)) break;
+
+    const delay = computeRetryDelay(resilience, attempt);
+    if (delay > 0) await sleep(delay);
+  }
+
+  return {
+    ok: false,
+    attempts: maxAttempts,
+    durationMs: Date.now() - startTime,
+    findResult: lastFindResult,
+    error: lastError,
+  };
+}
+
+async function atomicSubmit(config: AuthConfig, options: AtomicSubmitOptions): Promise<ActionResult> {
+  const startTime = Date.now();
+  const resilience = options.resilience ?? {};
+  const maxAttempts = Math.max(1, resilience.retries ?? 1);
+  const overallTimeoutMs = resilience.timeoutMs ?? 0;
+  let lastError: ActionError | undefined;
+  let lastFindResult: ActionFindResult | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (overallTimeoutMs > 0 && Date.now() - startTime >= overallTimeoutMs) {
+      lastError = { tier: 'D', code: 'TIMEOUT', message: `Overall timeout of ${overallTimeoutMs}ms exceeded`, rawMessage: '', retryable: false };
+      break;
+    }
+    await launchDaemon(config);
+
+    if (resilience.waitForStable) {
+      await runBridge(config, {
+        op: 'execute',
+        action: {
+          type: 'waitForStable' as const,
+          stabilityWindowMs: resilience.stabilityWindowMs,
+        },
+      });
+    }
+
+    // No dedicated findAndSubmit bridge op exists yet — use findAndClick
+    // which clicks the submit target (button/input[type=submit]).
+    const findPayload = targetToBridgePayload(options.target);
+    const bridgeResult = await runBridge(config, {
+      op: 'findAndClick',
+      find: findPayload,
+      coordinateFallback: resilience.coordinateFallback ?? false,
+    });
+
+    const ok = Boolean(bridgeResult.ok);
+    const findResult = toBridgeFindResult(bridgeResult.element as Record<string, unknown> | null);
+    const coordinatesUsed = bridgeResult.coordinatesUsed as ActionResult['coordinatesUsed'];
+    lastFindResult = findResult ?? lastFindResult;
+
+    if (ok) {
+      let verification: VerificationResult | undefined;
+      if (options.verify) {
+        const verifyResult = await runBridge(config, {
+          op: 'verify',
+          check: options.verify,
+        });
+        verification = {
+          passed: Boolean(verifyResult.passed),
+          message: String(verifyResult.message ?? ''),
+          durationMs: Number(verifyResult.durationMs ?? 0),
+        };
+      }
+
+      return {
+        ok: true,
+        attempts: attempt,
+        durationMs: Date.now() - startTime,
+        findResult,
+        coordinatesUsed,
+        verification,
+      };
+    }
+
+    const actionError = toBridgeActionError(bridgeResult.error as Record<string, unknown> | undefined)
+      ?? classifyError(bridgeResult.error ?? 'Unknown bridge error');
+    lastError = actionError;
+
+    if (!shouldRetry(actionError, resilience, attempt)) break;
+
+    const delay = computeRetryDelay(resilience, attempt);
+    if (delay > 0) await sleep(delay);
+  }
+
+  return {
+    ok: false,
+    attempts: maxAttempts,
+    durationMs: Date.now() - startTime,
+    findResult: lastFindResult,
+    error: lastError,
+  };
 }
 
 async function findBySelector(

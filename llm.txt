@@ -18,7 +18,7 @@ Optional env configuration
 Runtime model
 - Tool ensures one persistent Chrome daemon with CDP.
 - `open` navigates using CDP (existing tab unless `newWindow` is requested).
-- Grid APIs (`gridScreenshot`, `scanZones`, `execute`) require CDP.
+- Grid APIs (`gridScreenshot`, `gridScreenshotText`, `gridScreenshotInteractive`, `scanZones`, `execute`) require CDP.
 - Per-call wait strategy is available on `open`, `launch`, `scanZones`, `labels`, `labelsOverview`, and `labelsInRange`:
   - `waitUntil: "domcontentloaded" | "load" | "networkidle"`
   - `timeoutMs: number`
@@ -27,6 +27,11 @@ Runtime model
 - Gemini request timeout is configurable with `requestTimeoutMs` on:
   - `labels`, `labelsOverview`, `labelsInRange`, `labelsByZones`, `findInteractiveElement`
 - `scanZones` returns deterministic element selectors (no `kb` token system).
+- `scanInteractive()` scans the ENTIRE page for all interactive elements (no zone restriction).
+  Returns each element with an ID-anchored CSS selector that walks up to the nearest ancestor
+  with an `id`, then builds a child-combinator path down (e.g. `div#login-form > div:nth-of-type(2) > button`).
+  Pairs with `gridScreenshotInteractive()` — the image shows WHERE controls are, this query returns
+  WHAT they are with selectors ready for `execute()`. Faster than Gemini vision for getting the action space.
 - `execute` click/type/select/submit actions require `selector`.
 - `execute` `click` and `submit` also support `waitForNavigation`:
   - `true` for default wait
@@ -49,110 +54,851 @@ Runtime model
 - `labels` requires `GEMINI_API_KEY`; if missing it throws.
 - `findInteractiveElement` captures a full grid screenshot and asks Gemini for one best matching interactive element by query.
 - `findInteractiveElement` requires `GEMINI_API_KEY`; if missing it throws.
+- `screenshot`, `screenshotBase64`, `saveScreenshot` capture clean screenshots WITHOUT grid overlay.
+- `execute` supports `scrollIntoView` action: `{ type: 'scrollIntoView', selector }` to scroll an element into the viewport center.
+
+## Tool Classification
+
+### Internal tools (NOT for presenting to users)
+Grid-overlaid screenshots and vision analysis for agent navigation:
+- gridScreenshot, saveGridScreenshot, gridScreenshotBase64
+- gridScreenshotText, saveGridScreenshotText, gridScreenshotTextBase64
+- gridScreenshotInteractive, saveGridScreenshotInteractive, gridScreenshotInteractiveBase64
+- scanZones, scanInteractive
+- labels, labelsOverview, labelsInRange, labelsByZones
+- findInteractiveElement
+
+### User-facing tools (for presenting visual information)
+Clean screenshots without grid overlay:
+- screenshot, saveScreenshot, screenshotBase64
+- screenshotText, saveScreenshotText, screenshotTextBase64
+- screenshotInteractive, saveScreenshotInteractive, screenshotInteractiveBase64
+
+### Query tools (finding elements in the DOM)
+- findBySelector, findByRole, findByLabel, findByText
+
+### Action tools (interacting with the page)
+- execute, open, launch, launchDaemon
+
+NEVER use gridScreenshot or saveGridScreenshot when the goal is to show the user what a page looks like. Use screenshot/saveScreenshot instead.
+
+## PAGE INTERACTION WORKFLOW (MANDATORY)
+
+When you need to interact with a page (click, type, fill forms, navigate), ALWAYS
+follow this 3-step sequence. Each step only runs if the previous one was insufficient.
+
+### Step 1: scanInteractive() — "What can I do?" (Structured Data)
+ALWAYS call `scanInteractive()` FIRST. This returns every interactive element on
+the page as structured data with ID-anchored CSS selectors. No screenshot needed,
+no vision model, instant results.
+
+- Returns: element tag, text, type, role, and a ready-to-use CSS selector
+- Selectors work directly with `execute()` — no additional lookup needed
+- Covers: buttons, links, inputs, selects, textareas, ARIA controls, cursor:pointer elements
+
+**If scanInteractive gives you the selector you need → go straight to execute(). DONE.**
+
+### Step 2: gridScreenshotInteractive() — "Where are the controls?" (Visual Map)
+Call ONLY if Step 1 results are ambiguous — multiple similar elements, unclear which
+one is the right target, or you need spatial context to distinguish between options.
+
+- Shows ONLY interactive elements on a white canvas with the grid overlay
+- Use to visually confirm which element is the correct target
+- Cross-reference grid cell positions with scanInteractive selectors to disambiguate
+
+**If the visual map clarifies the target → execute(). DONE.**
+
+### Step 3: gridScreenshot() — "What's the full picture?" (Full Context)
+Call ONLY if Steps 1 and 2 were not enough — you need surrounding page context
+(text labels near controls, page layout, section boundaries) to make a decision.
+
+- Shows the full page with all content, images, and controls
+- Use when the interactive-only view lacks enough spatial context
+- This is the most expensive step — avoid it when earlier steps suffice
+
+### CRITICAL RULES
+- NEVER skip Step 1. `scanInteractive()` is always your first move for any interaction task.
+- NEVER jump to Step 3 without trying Steps 1 and 2 first.
+- If Step 1 gives you what you need, execute immediately. Do not take unnecessary screenshots.
+- This workflow is for INTERACTION. For reading/understanding page content, use gridScreenshotText or the DOM query tools.
+- Vision APIs (labels, labelsOverview) are for content understanding, NOT for finding things to click.
+
+### Workflow Example
+```ts
+// Step 1: Get structured action space
+const elements = await tools["chrome-browser"].scanInteractive();
+const loginBtn = elements.find(el => /log.?in|sign.?in/i.test(el.text));
+
+if (loginBtn) {
+  // Found it — skip screenshots, act immediately
+  await tools["chrome-browser"].execute({ type: "click", selector: loginBtn.selector });
+} else {
+  // Step 2: Visual disambiguation
+  const interactiveView = await tools["chrome-browser"].gridScreenshotInteractiveBase64();
+  // Examine the image to locate the target visually...
+
+  // Step 3: Full context (only if still unclear)
+  const fullView = await tools["chrome-browser"].gridScreenshotBase64();
+  // Now you can see text labels, layout, and controls together
+}
+```
+
+## WHEN TO USE GRID vs CLEAN SCREENSHOTS
+
+Grid screenshots (gridScreenshot, saveGridScreenshot):
+- Internal navigation and zone mapping
+- Input to Gemini vision APIs (labels, labelsOverview, etc.)
+- scanZones coordinate mapping
+- NEVER for presenting to the user
+
+Clean screenshots (screenshot, saveScreenshot):
+- Showing the user what a page looks like
+- Design review and QA verification
+- Capturing the current state of development
+- Any time the user asks to "look at" or "see" something
+- Visual inspection after scrolling to an element
+
+Clean text screenshots (screenshotText, saveScreenshotText):
+- Showing the user only text content from a page (no visual noise)
+- Text extraction and content review
+
+Clean interactive screenshots (screenshotInteractive, saveScreenshotInteractive):
+- Showing the user what controls exist on a page (buttons, links, inputs on white)
+- UI audit and accessibility review
+
+## THREE VISUAL CHANNELS: Focused Perception
+
+The tool provides three grid screenshot channels. All three share the SAME dimensions,
+SAME grid cell labels (A1, B2, C3...), and SAME coordinate space. The only difference
+is what content appears under the grid.
+
+### Channel 1: gridScreenshot — "Where am I?" (Context)
+- Shows the FULL page as-is: layout, images, text, controls, everything.
+- Use to understand page type, layout structure, and overall visual context.
+- This is the default channel. Use it when you need a general picture.
+
+### Channel 2: gridScreenshotText — "What does this page say?" (Reading)
+- Shows ONLY text-containing regions (paragraphs, headings, labels, list items)
+  on a white canvas. Icons, images, decorations, and controls are removed.
+- Use when you need to READ the page: summarize content, find headings,
+  understand instructions, extract information from text.
+- Removes visual noise so you can focus purely on readable content.
+
+### Channel 3: gridScreenshotInteractive — "What can I do?" (Action)
+- Shows ONLY interactive elements (buttons, links, inputs, selects, checkboxes,
+  ARIA controls) on a white canvas. Text content and decorations are removed.
+- Use when you need to understand the ACTION SPACE: what can be clicked,
+  typed into, toggled, or submitted.
+- Makes the complete set of available interactions explicit and unambiguous.
+
+### When to use each channel
+
+| Goal | First Try | Then If Needed | Method |
+|------|-----------|----------------|--------|
+| Interact with page controls | scanInteractive() | gridScreenshotInteractive() → gridScreenshot() | See PAGE INTERACTION WORKFLOW above |
+| Read page content / extract text | — | — | gridScreenshotText() |
+| General page understanding | — | — | gridScreenshot() |
+| Input to Gemini labels() / labelsOverview() | — | — | gridScreenshot() (existing flow) |
+| Understand form layout before filling | scanInteractive() | gridScreenshotInteractive() | See PAGE INTERACTION WORKFLOW above |
+| Summarize an article or product page | — | — | gridScreenshotText() |
+
+### Coordinate alignment (critical)
+All three channels produce images with IDENTICAL grid overlays. Grid cell A1
+refers to the SAME physical page area in all three images. You can cross-reference
+between channels: find an interactive element at B3 in the action channel, then
+check what text surrounds B3 in the reading channel, and see the visual context
+at B3 in the context channel.
+
+### Cropping support
+All three channels support the same `{ start, end }` grid range cropping as
+gridScreenshot. Use it to focus on a specific area:
+```ts
+gridScreenshotText({ start: 'A1', end: 'F4' })       // text in top-left region
+gridScreenshotInteractive({ start: 'C3', end: 'H8' }) // controls in center area
+```
+
+IMPORTANT — Targeted area screenshots during web development:
+When working on a specific area of a page (e.g., a header, form, sidebar, or
+component), ALWAYS crop to that area using the start/end grid range instead of
+capturing the full page. Full-page screenshots include irrelevant content that
+wastes context and makes it harder to evaluate the area of interest.
+- Working on a nav bar? -> screenshot({ start: 'A1', end: 'J2' })
+- Reviewing a form? -> scrollIntoView the form, then screenshot with a range
+- Checking a footer? -> scroll down, then crop to the footer zone
+Only capture full-page screenshots when the user explicitly asks to see the
+entire page or when you need a broad overview of the layout.
+
+## ELEMENT GRID RANGE: Automatic Coordinate Mapping
+
+Every findBySelector/findByRole/findByLabel/findByText result now includes:
+- `boundingBox`: `{ x, y, width, height }` in image-pixel space (DPR-scaled)
+- `gridRange`: `{ start, end }` — the grid cell range covering the element
+
+gridRange uses PAGE-LEVEL coordinates (includes scroll offset), so it is stable
+regardless of current scroll position. When you pass a gridRange to screenshot(),
+it automatically captures a full-page image before cropping, so the coordinates
+always resolve correctly. You do NOT need to scroll first — just pass the gridRange:
+
+
+```ts
+const nav = await findBySelector('nav.main-header');
+// nav.gridRange = { start: 'A1', end: 'J2' }
+await execute({ type: 'scrollIntoView', selector: nav.selector });
+const image = await screenshot(nav.gridRange);  // cropped to just the nav
+```
+
+WHY THIS MATTERS for web development:
+- Full-page screenshots waste context by including unrelated content
+- When developing a specific component, you want to see ONLY that component
+- gridRange gives you the exact crop coordinates automatically
+- No need to manually estimate which grid cells an element occupies
+
+ALWAYS use the returned gridRange when taking screenshots of specific elements
+during development. This produces focused, relevant captures that are easier
+to evaluate for design, layout, and functional correctness.
+
+## POST-FIND BEHAVIOR: Scroll to Element
+
+When you find an element via findBySelector/findByRole/findByLabel/findByText
+and the intent involves visual inspection or observation:
+
+1. Scroll the element into view:
+   execute({ type: 'scrollIntoView', selector: found.selector })
+
+2. Take a targeted clean screenshot using the element's grid range:
+   const image = await screenshot(found.gridRange);
+
+This applies when the user says: "look at", "show me", "check", "find and show",
+"scroll to", or any phrase implying they want to SEE the element.
+
+DO NOT just return the element's metadata. The user wants to see it visually.
+DO NOT take a full-page screenshot when a gridRange is available — crop to the element.
 
 Typical intents to map
+
+### DOM-First Queries (PREFERRED - 360x faster)
+- "find button by ID/class" -> findBySelector('#submit-btn') [0.1s, Tier 1]
+- "find submit button" -> findByRole('button', { name: 'Submit' }) [0.5s, Tier 2]
+- "find email input" -> findByLabel('Email') [0.5s, Tier 2]
+- "find sign in button" -> findByText('Sign In', { tag: 'button' }) [0.5s, Tier 2]
+- "find all links" -> findByRole('link', { all: true }) [0.5s, Tier 2]
+- "find navigation menu" -> findByRole('navigation') [0.5s, Tier 2]
+
+### Vision Queries (USE SPARINGLY - slow)
+- "find logo/button by text" -> findInteractiveElement(query, { model? }) [90-180s, Tier 4]
+- "analyze full page labels" -> labels({ model? }) [90s, Tier 4]
+- "get quick page map first" -> labelsOverview({ model?, waitUntil?, timeoutMs? }) [90s, Tier 4]
+- "analyze one area deeply" -> labelsInRange({ start, end }, { model?, detailLevel?, focus?, waitUntil?, timeoutMs? }) [90s, Tier 4]
+- "analyze several areas deeply" -> labelsByZones([{ start, end }], { model?, detailLevel?, focus? }) [90s per zone, Tier 4]
+
+### Basic Operations
 - "start browser daemon" -> launchDaemon()
 - "open website" -> open(url)
 - "open website and wait for network settle" -> open(url, { waitUntil: "networkidle", timeoutMs: 30000 })
 - "scan area" -> scanZones([{ start, end }], { waitUntil?: "domcontentloaded" | "load" | "networkidle", timeoutMs? })
 - "scan area from overview grid" -> scanZones([{ start, end }], { coordinateSpace: "page", ... })
+- "list all interactive elements" -> scanInteractive() — ALWAYS call this first for any interaction task
+- "what can I click on this page" -> scanInteractive() — full action space as structured data
+- "I need to click something" -> scanInteractive() first, then gridScreenshotInteractive() if ambiguous, then gridScreenshot() as last resort
+- "fill out this form" -> scanInteractive() to get all form fields and submit button, then execute()
 - "click/type" -> execute({ type: "click" | "type", selector, ... })
 - "submit form" -> execute({ type: "submit", selector })
 - "submit and wait for page change" -> execute({ type: "submit", selector, waitForNavigation: true })
 - "wait for initial page readiness" -> execute({ type: "waitForLoadState", state: "domcontentloaded" })
 - "wait for control visibility" -> execute({ type: "waitForSelector", selector, state: "visible" })
-- "analyze full page labels" -> labels({ model? })
-- "get quick page map first" -> labelsOverview({ model?, waitUntil?, timeoutMs? })
-- "analyze one area deeply" -> labelsInRange({ start, end }, { model?, detailLevel?, focus?, waitUntil?, timeoutMs? })
-- "analyze several areas deeply" -> labelsByZones([{ start, end }], { model?, detailLevel?, focus? })
-- "find logo/button by text" -> findInteractiveElement(query, { model? })
+- "scroll to element" -> execute({ type: "scrollIntoView", selector })
 
-Execution guidance for unfamiliar sites
-- IMPORTANT: Do not treat visual interaction as a one-shot operation.
-- IMPORTANT: If an attempt fails, retry with broader zones before giving up.
-- Do not rely on URL shortcuts as first choice.
-- Before first interaction, prefer `waitForLoadState` over fixed sleeps.
-- Refresh perception after each major action: rerun `labels` or `scanZones`.
-- Prefer staged Gemini calls for speed:
-  1) `labelsOverview()` first
-  2) `labelsInRange()` only where needed
-- Use `labels`/`findInteractiveElement` for grid hints, then `scanZones` for live selectors.
-- For searches/forms, prefer `execute({ type: "submit", selector })` on the nearest input/button/form.
-- For state changes expected to navigate, pass `waitForNavigation` to `click`/`submit` rather than polling tabs.
-- Avoid one-shot automation. Use attempt-based retries:
-  1) Try the smallest likely zone first (from `labelsOverview`).
-  2) If target not found or action fails, end that attempt.
-  3) Re-query and broaden zones incrementally (for example `A1:X2` -> `A1:AL6` -> `A1:AL10`).
-  4) Re-run `scanZones` for the new zone and retry action.
-  5) After successful navigation, run a fresh `labelsOverview` before next step.
-- If target is still missing after broader retries, fail clearly with the zones attempted.
+### Observation & Review (user-facing — use clean screenshots)
+- "look at the page" -> screenshot()
+- "show me the page" -> screenshot() or saveScreenshot(path)
+- "how does it look" -> screenshot()
+- "check how the page looks" -> screenshot()
+- "review the design" -> screenshot()
+- "take a screenshot" -> saveScreenshot(path)
+- "look at this element" -> findBy*() + scrollIntoView + screenshot(found.gridRange)
+- "show me the header" -> find element + scrollIntoView + screenshot(found.gridRange)
+- "check the nav bar" -> findBySelector('nav') + scrollIntoView + screenshot(found.gridRange)
 
-Code example
-```ts
-await tools["chrome-browser"].launchDaemon();
-await tools["chrome-browser"].open("https://example.com", { waitUntil: "domcontentloaded", timeoutMs: 30000 });
-await tools["chrome-browser"].execute({ type: "waitForLoadState", state: "domcontentloaded" });
-const overview = await tools["chrome-browser"].labelsOverview({ model: "gemini-2.5-flash" });
-const zoneAttempts = [
-  { start: "C1", end: "I2" },
-  { start: "A1", end: "AL6" },
-  { start: "A1", end: "AL10" },
-];
-let selector = "";
-for (const zone of zoneAttempts) {
-  const labels = await tools["chrome-browser"].labelsInRange(zone, {
-    model: "gemini-2.5-flash",
-    detailLevel: "high",
-    focus: "search controls",
-  });
-  const scan = await tools["chrome-browser"].scanZones([zone], {
-    waitUntil: "domcontentloaded",
-    timeoutMs: 12000,
-    coordinateSpace: overview.gridSpace,
-  });
-  const input = (scan[0]?.elements || []).find((el) => el.tag === "INPUT");
-  if (input?.selector) {
-    selector = input.selector;
-    break;
-  }
-}
-if (!selector) throw new Error("Search input not found after zone retries.");
-await tools["chrome-browser"].execute({ type: "click", selector });
-await tools["chrome-browser"].execute({ type: "type", selector, text: "obama" });
-await tools["chrome-browser"].execute({
-  type: "submit",
-  selector,
-  waitForNavigation: { timeoutMs: 12000, urlIncludes: "/search" },
-});
-const afterNav = await tools["chrome-browser"].labelsOverview({ model: "gemini-2.5-flash" });
+## HYBRID NAVIGATION: DOM-First, Vision-Fallback (RECOMMENDED)
+
+The tool provides a 4-tier navigation system. **ALWAYS prefer DOM queries (Tier 1-2) over vision (Tier 3-4)** for 360x speedup.
+
+### Tier 1: Direct CSS Selectors (0.1s - FASTEST)
+Use when you know the exact CSS selector:
+- `findBySelector('#submit-button')` - ID selector
+- `findBySelector('button.primary')` - Class selector
+- `findBySelector('form input[type="email"]')` - Complex selector
+- `findBySelector('a.nav-link', { all: true })` - Multiple matches
+
+**Performance**: ~0.1s (1,800x faster than vision)
+**Use for**: Known structure, stable selectors, developer tools inspection
+
+### Tier 2: Accessibility & Text Queries (0.2-0.5s - FAST)
+Use for semantic queries without exact selectors:
+
+**findByRole** - ARIA role-based (preferred for accessibility):
+- `findByRole('button', { name: 'Submit' })` - Button with accessible name
+- `findByRole('link', { name: /pricing/i })` - Link with regex name match
+- `findByRole('checkbox', { state: { checked: true } })` - Checked checkbox
+- `findByRole('navigation')` - Navigation landmark
+- `findByRole('textbox', { all: true })` - All input fields
+
+**findByLabel** - Find by form label or aria-label:
+- `findByLabel('Email address')` - Input with label
+- `findByLabel(/email/i)` - Regex label match
+- `findByLabel('Password', { exact: true })` - Exact label match
+
+**findByText** - Find by visible text content:
+- `findByText('Sign In', { tag: 'button' })` - Button with text
+- `findByText(/learn more/i, { tag: 'a' })` - Link with regex text
+- `findByText('Submit', { exact: true })` - Exact text match
+
+**Performance**: ~0.2-0.5s (360x faster than vision)
+**Use for**: 95% of navigation tasks - forms, buttons, links, semantic elements
+
+### Tier 3-4: Vision APIs (2-90s - Use Sparingly)
+
+Use for:
+- Complex spatial relationships ("icon in top-right corner")
+- Visual-only elements (canvas, images, custom widgets)
+- When DOM structure is unreliable or missing semantic markup
+
+**Available vision APIs:**
+- `findInteractiveElement(query)` - Natural language query (90-180s)
+- `labels()` - Full page vision analysis (90s)
+- `labelsInRange()` - Zone vision analysis (90s)
+
+### Decision Tree for Element Finding
+
+```
+Need to INTERACT with something (click, type, submit)?
+  │
+  ├─ Step 1: scanInteractive() [instant — ALWAYS start here]
+  │   Found target selector? → execute() — DONE
+  │
+  ├─ Step 2: gridScreenshotInteractive() [visual disambiguation]
+  │   Can identify target? → execute() — DONE
+  │
+  └─ Step 3: gridScreenshot() [full context, last resort]
+
+Need to find a SPECIFIC known element?
+  │
+  ├─ Know exact CSS selector? → findBySelector() [0.1s, Tier 1]
+  │
+  ├─ Know semantic role/label/text?
+  │   ├─ ARIA role? → findByRole() [0.5s, Tier 2]
+  │   ├─ Form label? → findByLabel() [0.5s, Tier 2]
+  │   └─ Visible text? → findByText() [0.5s, Tier 2]
+  │
+  └─ Complex visual query only?
+      └─ findInteractiveElement() [90-180s, Tier 3-4]
 ```
 
-## MANDATORY: Mini-Call Mode (Kazibee)
+### When to Use Vision APIs
 
-When using `kazibee exec`, follow atomic step execution only.
+Use vision APIs for:
+- Canvas-based UIs (charts, image editors, games)
+- Spatial relationships ("settings icon in top right")
+- Visual verification ("check if button is red")
+- Pages with poor semantic markup (no ARIA, no labels)
+- Custom widgets without standard roles
 
-### Hard Rules
-1. One `kazibee exec` = one step type only.
-2. Allowed step types:
-   - `observe` (overview/list/tabs)
-   - `inspect` (zone scan / detailed zone labels)
-   - `act` (single click OR single type OR single submit OR single navigate)
-   - `wait` (single wait action)
-   - `verify` (url/tabs/state check)
-3. Never combine step types in one call.
-   - Forbidden: click+type, type+submit, inspect+act, act+verify in same call.
-4. After each call, stop and report result before next call.
-5. If target not found, next call must be `inspect` with broader zone.
-6. On failure, do not switch strategy silently. Report failure and run next mini-call retry.
-7. No curl or offline fallback for browser tasks. Browser tool calls only.
+## BROWSER STATE PERSISTENCE
 
-### Required Output After Every Call
-- Step type
-- Exact command run
-- Raw result JSON
-- 1-line interpretation
-- Next planned step (not executed yet)
+The Chrome CDP connection preserves all browser state between operations:
+- **Scroll position persists** — if you scrolled down, the page stays scrolled down.
+- **Tab state persists** — open tabs, active tab, and URLs remain unchanged.
+- **Form state persists** — typed text, selected options, and focus stay intact.
+- **Page URL persists** — the page does not reload or navigate between operations.
 
-### Violation Handling
-If you break any rule above, stop immediately and output:
-`Violation: combined steps in one exec. Resetting to Mini-Call Mode.`
+**ASSUME STATE IS PRESERVED.** Do not re-scroll, re-navigate, re-screenshot, or re-observe
+the page after every action. Only re-check state if an operation fails or returns unexpected results.
+
+BAD (wasteful re-observation):
+```
+scroll down -> screenshot -> find element -> screenshot -> click -> screenshot -> verify
+```
+
+GOOD (trust state, act directly):
+```
+scroll down -> find element -> click -> (only screenshot if needed for user or if something failed)
+```
+
+When to re-observe:
+- An execute/find operation throws an error or returns unexpected results
+- You navigated to a new page (URL changed)
+- User explicitly asks to "look at" or "show me" something
+- You suspect a modal/blocker appeared (e.g., click did nothing)
+
+When NOT to re-observe:
+- After a successful scroll (scroll position is preserved)
+- After a successful click that did not navigate (page state is preserved)
+- After typing into a field (the text is there)
+- Between sequential find queries on the same page
+- After taking a screenshot (screenshot does not change page state)
+
+Execution guidance for unfamiliar sites
+- IMPORTANT: If an attempt fails, DO NOT say "I can't find it" or give up. Follow the Recovery Protocol below.
+- Do not rely on URL shortcuts as first choice.
+- Before first interaction, prefer `waitForLoadState` over fixed sleeps.
+- Do NOT refresh perception after every action. Trust that state persists. Only re-observe if something fails.
+- For INTERACTION tasks, ALWAYS follow the Page Interaction Workflow:
+  1) `scanInteractive()` first — get structured action space instantly
+  2) `gridScreenshotInteractive()` only if ambiguous
+  3) `gridScreenshot()` only as last resort for full context
+- For READING/UNDERSTANDING tasks, use staged Gemini calls:
+  1) `labelsOverview()` first
+  2) `labelsInRange()` only where needed
+- Reserve `labels`/`findInteractiveElement` for complex visual queries. Do NOT use them when scanInteractive can answer the question.
+- For searches/forms, prefer `execute({ type: "submit", selector })` on the nearest input/button/form.
+- For state changes expected to navigate, pass `waitForNavigation` to `click`/`submit` rather than polling tabs.
+- Progressive wait strategy: After navigation or major DOM changes, use:
+  1) `waitForLoadState({ state: "domcontentloaded" })` (fast, 2-3s typical)
+  2) Only if needed: `waitForLoadState({ state: "networkidle" })` (slower, 10s timeout recommended)
+  3) For specific elements: `waitForSelector({ selector, state: "visible" })`
+- Mutation detection: Pages with >50 DOM mutations/sec in last 200ms are considered unstable.
+  Prefer explicit waits over polling when mutation threshold indicates dynamic content.
+
+## RECOVERY PROTOCOL: When You Cannot Find Your Target
+
+NEVER say "I don't see it" or give up after a single failed attempt. Follow this escalation ladder in order. Each phase is progressively broader and slower. Stop as soon as you find the target.
+
+### Retry Budget
+- Total budget: 5 recovery phases before declaring failure.
+- DOM phases (1-2): Fast, always attempt these first. Cost: <2s total.
+- Blocker phase (3): Medium speed. Cost: 2-10s.
+- Vision phases (4-5): Slow, use only after DOM and blocker checks fail. Cost: 90-180s each.
+- HARD LIMIT: Do not exceed 3 vision API calls (labels/labelsOverview/labelsInRange) in a single recovery sequence. If 3 vision calls have not resolved the issue, move to Phase 5 (structured failure).
+
+### Phase 1: DOM-First Search (ALWAYS start here -- 0.5s per attempt)
+
+When your initial attempt to find an element fails, try these DOM queries before anything else:
+
+```
+Step 1a: Broaden text matching
+  - Original: findByText('Sign Up', { tag: 'button', exact: true })
+  - Retry:    findByText(/sign.?up/i, { tag: 'button' })
+  - Retry:    findByText(/sign.?up/i)                        // drop tag filter
+  - Retry:    findByRole('button', { name: /sign.?up/i })    // try role instead
+
+Step 1b: Try alternative query strategies
+  - If findByText failed    -> try findByRole with similar name
+  - If findByRole failed    -> try findByLabel or findByText
+  - If findByLabel failed   -> try findBySelector with common patterns:
+      findBySelector('button[type="submit"]')
+      findBySelector('input[type="submit"]')
+      findBySelector('a[href*="signup"]')
+      findBySelector('[data-testid*="sign"]')
+
+Step 1c: Search for ALL interactive elements to see what IS on the page
+  - findByRole('button', { all: true })    // list all buttons
+  - findByRole('link', { all: true })      // list all links
+  - findByRole('textbox', { all: true })   // list all inputs
+  Review the returned list. Your target may have unexpected text, a different role,
+  or a different tag than expected.
+```
+
+If any DOM query returns results, use the selector directly. Do not proceed to later phases.
+
+### Phase 2: Scroll and Re-query (2-5s)
+
+The target may be outside the current viewport (below the fold, in a scrollable container).
+
+```
+Step 2a: Scroll down and re-query
+  - execute({ type: "scroll", direction: "down", amount: 500 })
+  - Repeat Phase 1 DOM queries
+  - Scroll up to 3 times (1500px total)
+
+Step 2b: Scroll back to top and check
+  - execute({ type: "scroll", direction: "up", amount: 2000 })
+  - The target may have been above the initial viewport
+
+Step 2c: Check if page has a scrollable container (not just the viewport)
+  - findBySelector('[style*="overflow: auto"], [style*="overflow: scroll"], [style*="overflow-y"]', { all: true })
+  - If found, the target may be inside a scrollable div, not the main page
+```
+
+### Phase 3: Blocker Detection and Dismissal (2-10s)
+
+CRITICAL: Before concluding the target is missing, check whether something is BLOCKING your view of it. Modals, banners, cookie consent dialogs, and overlays are the #1 reason agents get "lost."
+
+#### Step 3a: Detect common blockers with DOM queries (fast)
+
+Run these checks in order. Each takes <0.5s:
+
+```
+Cookie consent / GDPR banners:
+  findByRole('dialog')
+  findBySelector('[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]')
+  findBySelector('[class*="gdpr"], [id*="gdpr"]')
+  findByText(/accept.*cookie/i)
+  findByText(/accept all/i)
+  findByRole('button', { name: /accept|agree|got it|ok|close|dismiss/i })
+
+Notification / push permission banners:
+  findBySelector('[class*="notification"], [class*="banner"], [class*="toast"]')
+  findBySelector('[class*="popup"], [id*="popup"]')
+  findByRole('alertdialog')
+
+Modal dialogs:
+  findByRole('dialog')
+  findBySelector('[class*="modal"], [class*="overlay"], [class*="lightbox"]')
+  findBySelector('[role="dialog"], [aria-modal="true"]')
+  findBySelector('.modal-backdrop, .overlay-backdrop')
+
+Paywalls / subscription walls:
+  findBySelector('[class*="paywall"], [class*="subscribe"]')
+  findByText(/subscribe|sign up for free|create account/i)
+
+Generic close buttons (on any blocker):
+  findBySelector('[class*="close"], [aria-label*="close"], [aria-label*="Close"]')
+  findBySelector('button[class*="dismiss"], button[class*="close"]')
+  findByText(/close|dismiss|no thanks|maybe later|not now|skip/i, { tag: 'button' })
+  findBySelector('[data-testid*="close"], [data-dismiss]')
+```
+
+#### Step 3b: Dismiss the blocker
+
+When a blocker is found, dismiss it using one of these strategies (in priority order):
+
+```
+Strategy A: Click a close/dismiss/accept button (preferred)
+  - Use the selector found in Step 3a
+  - execute({ type: "click", selector: closeButtonSelector })
+  - Wait briefly: execute({ type: "waitForStable", stabilityWindowMs: 500 })
+
+Strategy B: Press Escape key (for modals)
+  - execute({ type: "click", selector: "body" })  // focus the page
+  - Many modals close on Escape. If no close button found, try clicking outside
+    the modal or pressing Escape via JavaScript evaluation.
+
+Strategy C: Hide the element via DOM (last resort)
+  - If the blocker has no close button and cannot be dismissed:
+    Use scanZones to find the blocker's selector, then note it and scroll past it.
+    Do NOT spend more than 2 attempts trying to dismiss a single blocker.
+```
+
+#### Step 3c: After dismissing, retry Phase 1
+
+After successfully dismissing a blocker, go back to Phase 1 (DOM-first search). The target is likely now visible.
+
+### Phase 4: Vision-Assisted Recovery (90s per call -- use sparingly)
+
+Use vision ONLY after Phases 1-3 have failed. This phase is expensive (90s+ per call).
+
+```
+Step 4a: Get a page overview to understand the layout
+  - labelsOverview()
+  - Read the regions list. Identify WHERE on the page your target might be.
+  - Look for regions described as forms, navigation, content areas, etc.
+  - Also look for regions described as banners, modals, overlays, popups
+    that Phase 3 may have missed.
+
+Step 4b: Scan the most likely zone with DOM
+  - Pick the region from overview that most likely contains your target
+  - scanZones([{ start, end }], { coordinateSpace: "page" })
+  - Review the elements list for your target
+
+Step 4c: Progressively broaden zones (max 2 more attempts)
+  - If Step 4b found nothing, broaden the zone:
+    Attempt 1: Double the zone area (e.g., A1:H4 -> A1:P8)
+    Attempt 2: Scan the entire page (e.g., A1:AL20 or whatever the full grid is)
+  - After each scan, check the elements list
+
+Step 4d: Use labelsInRange for deep analysis of a suspicious area
+  - If scanZones found elements but none match, use labelsInRange for AI analysis
+  - labelsInRange({ start, end }, { focus: "find the [target description]" })
+  - This gives Gemini a focused query to identify what the element actually looks like
+```
+
+### Phase 5: Structured Failure (after all phases exhausted)
+
+If Phases 1-4 all failed, report failure with full diagnostic context. NEVER just say "I couldn't find it."
+
+Required failure report format:
+```
+ELEMENT NOT FOUND: [target description]
+  Page URL: [current URL]
+  DOM queries attempted:
+    - findByText(...) -> [result count] results
+    - findByRole(...) -> [result count] results
+    - [list all queries tried]
+  Scroll attempts: [up/down amounts tried]
+  Blockers detected: [list any modals/banners found, whether dismissed]
+  Vision zones scanned: [list zone ranges attempted]
+  Elements found on page: [summary of what WAS found, e.g., "15 buttons, 8 links, 3 inputs"]
+  Possible causes:
+    - Element may load dynamically after user interaction
+    - Element may be inside an iframe
+    - Element may require authentication/login first
+    - Page may have redirected to unexpected URL
+  Suggested next steps:
+    - [specific actionable suggestions based on what was found]
+```
+
+### Recovery Decision Tree (Quick Reference)
+
+```
+Target not found?
+  |
+  +-> Phase 1: DOM queries (0.5s each, try 3-4 variants)
+  |     Found? -> DONE
+  |
+  +-> Phase 2: Scroll + re-query (2-5s)
+  |     Found? -> DONE
+  |
+  +-> Phase 3: Check for blockers (2-10s)
+  |     Blocker found? -> Dismiss it -> Back to Phase 1
+  |     No blocker? -> Continue
+  |
+  +-> Phase 4: Vision overview + zone scan (90-180s)
+  |     Found? -> DONE
+  |
+  +-> Phase 5: Structured failure report
+        Include all diagnostics. Suggest next steps.
+```
+
+## COMMON BLOCKER PATTERNS (Reference)
+
+These are the most frequently encountered page blockers that prevent agents from finding targets:
+
+| Blocker Type | Detection Signal | Dismissal Strategy |
+|-------------|-----------------|-------------------|
+| Cookie consent | `[class*="cookie"]`, `[id*="consent"]`, text "Accept" | Click "Accept All" or "Accept" button |
+| GDPR banner | `[class*="gdpr"]`, text "privacy" | Click "Accept" or "Close" button |
+| Newsletter popup | `[class*="modal"]` with "subscribe" text | Click close/X button or "No thanks" |
+| Push notification prompt | `[class*="notification"]`, "Allow" button | Click "No thanks", "Later", or "Block" |
+| Age verification | Text "Are you 18", "age" in class | Click "Yes" or age confirmation button |
+| Login wall | `[class*="modal"]` with "sign in" text | Look for "Continue as guest" or close button |
+| Ad overlay | `[class*="ad"]`, `[id*="ad"]`, iframe-based | Click close button (usually small X icon) |
+| Paywall | `[class*="paywall"]`, "subscribe" text | May not be dismissible -- report as blocker |
+| Chat widget | `[class*="chat"]`, `[id*="intercom"]` | Usually does not block interaction -- ignore |
+| Survey popup | `[class*="survey"]`, "feedback" text | Click "No thanks" or close button |
+
+## ANTI-PATTERNS: What NOT To Do When Stuck
+
+- DO NOT say "I don't see the element" and stop. Follow the Recovery Protocol.
+- DO NOT run labelsOverview() as your first recovery step. Try DOM queries first (360x faster).
+- DO NOT retry the exact same query that just failed. Broaden or vary the query.
+- DO NOT run more than 3 vision API calls in a single recovery sequence.
+- DO NOT ignore blockers. If you cannot see the target, something may be covering it.
+- DO NOT scroll endlessly. 3 scroll attempts (1500px) is the limit before trying other strategies.
+- DO NOT give up without reporting what you DID find on the page. The user needs diagnostics.
+- DO NOT assume the page is broken. 90% of "missing element" cases are caused by
+  blockers, different text than expected, or the element being below the fold.
+
+Code examples
+
+### Example 1: DOM-First Navigation (RECOMMENDED - 360x faster)
+```ts
+await tools["chrome-browser"].launchDaemon();
+await tools["chrome-browser"].open("https://example.com", { waitUntil: "domcontentloaded", timeoutMs: 10000 });
+await tools["chrome-browser"].execute({ type: "waitForLoadState", state: "domcontentloaded" });
+
+// Use DOM-first queries (0.5s) instead of vision (180s)
+const input = await tools["chrome-browser"].findByRole("textbox", { name: /search/i });
+// OR: await tools["chrome-browser"].findByLabel("search");
+// OR: await tools["chrome-browser"].findBySelector("input[type='search']");
+
+if (!input) throw new Error("Search input not found");
+
+// Batched form submission (aggressive batching allowed)
+await tools["chrome-browser"].execute({ type: "click", selector: input.selector });
+await tools["chrome-browser"].execute({ type: "type", selector: input.selector, text: "obama" });
+await tools["chrome-browser"].execute({
+  type: "submit",
+  selector: input.selector,
+  waitForNavigation: { timeoutMs: 10000, urlIncludes: "/search" },
+});
+
+// Verify navigation with DOM query (fast)
+const results = await tools["chrome-browser"].findByRole("main");
+```
+
+### Example 2: Fallback to Vision (for complex cases)
+```ts
+// When DOM queries fail or for visual verification
+await tools["chrome-browser"].launchDaemon();
+await tools["chrome-browser"].open("https://complex-site.com", { waitUntil: "domcontentloaded", timeoutMs: 10000 });
+
+// Try DOM first (fast)
+let button = await tools["chrome-browser"].findByText("Submit", { tag: "button" });
+
+if (!button) {
+  // Fallback to vision only when needed (slow)
+  const overview = await tools["chrome-browser"].labelsOverview({ model: "gemini-2.5-flash" });
+  const zoneAttempts = [
+    { start: "C1", end: "I2" },
+    { start: "A1", end: "AL6" },
+  ];
+  let selector = "";
+  for (const zone of zoneAttempts) {
+    const scan = await tools["chrome-browser"].scanZones([zone], {
+      waitUntil: "domcontentloaded",
+      timeoutMs: 10000,
+      coordinateSpace: overview.gridSpace,
+    });
+    const btn = (scan[0]?.elements || []).find((el) => el.tag === "BUTTON");
+    if (btn?.selector) {
+      selector = btn.selector;
+      break;
+    }
+  }
+  if (!selector) throw new Error("Button not found after zone retries.");
+  button = { selector };
+}
+
+await tools["chrome-browser"].execute({ type: "click", selector: button.selector });
+```
+
+### Example 3: Recovery Protocol (when target is not found)
+```ts
+// Scenario: Agent needs to click "Sign Up" button but page has a cookie consent banner blocking it.
+await tools["chrome-browser"].launchDaemon();
+await tools["chrome-browser"].open("https://example.com", { waitUntil: "domcontentloaded", timeoutMs: 10000 });
+await tools["chrome-browser"].execute({ type: "waitForLoadState", state: "domcontentloaded" });
+
+// Phase 1: DOM-first search (0.5s each)
+let signUp = await tools["chrome-browser"].findByRole("button", { name: /sign.?up/i });
+if (!signUp) signUp = await tools["chrome-browser"].findByText(/sign.?up/i, { tag: "button" });
+if (!signUp) signUp = await tools["chrome-browser"].findByText(/sign.?up/i);  // drop tag filter
+if (!signUp) signUp = await tools["chrome-browser"].findBySelector('a[href*="signup"], a[href*="register"]');
+
+if (!signUp) {
+  // Phase 2: Scroll down and retry
+  await tools["chrome-browser"].execute({ type: "scroll", direction: "down", amount: 500 });
+  signUp = await tools["chrome-browser"].findByRole("button", { name: /sign.?up/i });
+}
+
+if (!signUp) {
+  // Phase 3: Check for blockers
+  const cookieBanner = await tools["chrome-browser"].findByRole("button", { name: /accept|agree|got it/i });
+  if (cookieBanner) {
+    // Dismiss the blocker
+    await tools["chrome-browser"].execute({ type: "click", selector: cookieBanner.selector });
+    await tools["chrome-browser"].execute({ type: "waitForStable", stabilityWindowMs: 500 });
+    // Retry Phase 1 after dismissal
+    signUp = await tools["chrome-browser"].findByRole("button", { name: /sign.?up/i });
+  } else {
+    // Check for modal overlay
+    const closeBtn = await tools["chrome-browser"].findBySelector(
+      '[class*="close"], [aria-label*="close"], [aria-label*="Close"], button[class*="dismiss"]'
+    );
+    if (closeBtn) {
+      await tools["chrome-browser"].execute({ type: "click", selector: closeBtn.selector });
+      await tools["chrome-browser"].execute({ type: "waitForStable", stabilityWindowMs: 500 });
+      signUp = await tools["chrome-browser"].findByRole("button", { name: /sign.?up/i });
+    }
+  }
+}
+
+if (!signUp) {
+  // Phase 4: Vision-assisted recovery (expensive -- only after DOM + blocker checks failed)
+  const overview = await tools["chrome-browser"].labelsOverview();
+  // Find the region most likely to contain a sign-up action
+  const targetRegion = overview.regions.find((r) =>
+    /sign.?up|register|account|hero|cta/i.test(r.description)
+  );
+  if (targetRegion) {
+    const [start, end] = targetRegion.gridRange.split(":");
+    const scan = await tools["chrome-browser"].scanZones([{ start, end }], {
+      coordinateSpace: overview.gridSpace,
+    });
+    const btn = (scan[0]?.elements || []).find((el) =>
+      /sign.?up|register|get started/i.test(el.text || "")
+    );
+    if (btn?.selector) signUp = { selector: btn.selector };
+  }
+}
+
+if (!signUp) {
+  // Phase 5: Structured failure -- list what WAS found for diagnostics
+  const allButtons = await tools["chrome-browser"].findByRole("button", { all: true });
+  const allLinks = await tools["chrome-browser"].findByRole("link", { all: true });
+  throw new Error(
+    `ELEMENT NOT FOUND: "Sign Up" button\n` +
+    `  Buttons on page: ${(allButtons || []).length} -- ` +
+    `${(allButtons || []).slice(0, 5).map((b) => b.text).join(", ")}\n` +
+    `  Links on page: ${(allLinks || []).length} -- ` +
+    `${(allLinks || []).slice(0, 5).map((l) => l.text).join(", ")}\n` +
+    `  Recovery phases attempted: DOM queries, scroll, blocker check, vision overview`
+  );
+}
+
+await tools["chrome-browser"].execute({ type: "click", selector: signUp.selector });
+```
+
+## MANDATORY: Mini-Call Mode (Kazibee) - AGGRESSIVE BATCHING
+
+When using `kazibee exec`, batch related operations within safety constraints.
+
+### Core Batching Rules
+1. **Aggressive Operation Groups** (allowed in single `kazibee exec`):
+   - Form workflows: `click → type → submit` (complete form interaction)
+   - Multi-field forms: `type(field1) → type(field2) → submit`
+   - Navigation sequences: `click(link) → waitForNavigation → waitForLoadState`
+   - Element prep: `waitForSelector → click → type`
+   - State verification: `act → verify` (action + immediate check)
+
+2. **Safety Guardrails** (must remain separate calls):
+   - Inspection BEFORE action: `observe`/`inspect` must complete before `act`
+   - Broad zone retries: If target not found, next call is `inspect` with broader zone
+   - Cross-page operations: Never batch actions across navigation boundaries
+   - Unknown outcomes: If action result is uncertain, stop and verify separately
+
+3. **Batching Conditions**:
+   - Batch only when all operations target same page state
+   - Skip framework detection (assume modern SPA unless proven otherwise)
+   - Mutation threshold: >50 mutations/sec = unstable, use separate waits
+   - Default timeout: 10s for batched sequences
+   - If any operation in batch fails, report entire batch failure
+
+### Operation Groups by Category
+
+**Form Submission (safe to batch):**
+```typescript
+// Single field + submit
+execute([
+  { type: "click", selector: "input#search" },
+  { type: "type", selector: "input#search", text: "query" },
+  { type: "submit", selector: "input#search", waitForNavigation: true }
+])
+
+// Multi-field form
+execute([
+  { type: "type", selector: "input#email", text: "user@example.com" },
+  { type: "type", selector: "input#password", text: "pass123" },
+  { type: "submit", selector: "button[type=submit]", waitForNavigation: { timeoutMs: 10000 } }
+])
+```
+
+**Navigation + Wait (safe to batch):**
+```typescript
+execute([
+  { type: "click", selector: "a.next-page", waitForNavigation: true },
+  { type: "waitForLoadState", state: "domcontentloaded" }
+])
+```
+
+**Element Interaction (safe to batch when no navigation):**
+```typescript
+// Expand/interact with dynamic UI
+execute([
+  { type: "waitForSelector", selector: "button.expand", state: "visible" },
+  { type: "click", selector: "button.expand" },
+  { type: "waitForSelector", selector: ".expanded-content", state: "visible" }
+])
+```
+
+**Forbidden Batches:**
+- `inspect + act` (must verify targets exist first)
+- Actions across navigation (page1 click + page2 type)
+- Blind retries (if batch fails, must re-inspect before retry)
+
+### Required Output After Every Batched Call
+- Batch type (e.g., "form-submit", "nav-wait", "multi-field")
+- All operations in batch
+- Result for each operation
+- Overall success/failure
+- Next planned step (separate call)

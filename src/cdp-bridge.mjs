@@ -116,23 +116,63 @@ async function main() {
       const page = await getOrCreatePage(context, false);
       await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
       const element = await runDomQueryFirst(page, payload.find);
-      if (!element) throw new Error(`findAndClick: no element found (mode=${payload.find.mode}, query=${payload.find.query})`);
-      await page.click(element.selector);
-      result = { element, acted: true };
+      if (!element) {
+        const err = classifyBridgeError(new Error(`findAndClick: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
+        result = { ok: false, element: null, acted: false, error: err };
+      } else {
+        try {
+          await page.click(element.selector);
+          result = { ok: true, element, acted: true };
+        } catch (clickErr) {
+          if (payload.coordinateFallback && element.boundingBox) {
+            try {
+              const coordResult = await coordinateFallbackClick(page, element);
+              result = { ok: true, element, acted: true, coordinatesUsed: coordResult };
+            } catch (fallbackErr) {
+              const err = classifyBridgeError(fallbackErr);
+              result = { ok: false, element, acted: false, error: err };
+            }
+          } else {
+            const err = classifyBridgeError(clickErr);
+            result = { ok: false, element, acted: false, error: err };
+          }
+        }
+      }
     } else if (op === 'findAndType') {
       const page = await getOrCreatePage(context, false);
       await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
       const element = await runDomQueryFirst(page, payload.find);
-      if (!element) throw new Error(`findAndType: no element found (mode=${payload.find.mode}, query=${payload.find.query})`);
-      await atomicSetValue(page, element.selector, String(payload.text || ''));
-      result = { element, acted: true };
+      if (!element) {
+        const err = classifyBridgeError(new Error(`findAndType: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
+        result = { ok: false, element: null, acted: false, error: err };
+      } else {
+        try {
+          await atomicSetValue(page, element.selector, String(payload.text || ''));
+          result = { ok: true, element, acted: true };
+        } catch (typeErr) {
+          const err = classifyBridgeError(typeErr);
+          result = { ok: false, element, acted: false, error: err };
+        }
+      }
     } else if (op === 'findAndSelect') {
       const page = await getOrCreatePage(context, false);
       await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
       const element = await runDomQueryFirst(page, payload.find);
-      if (!element) throw new Error(`findAndSelect: no element found (mode=${payload.find.mode}, query=${payload.find.query})`);
-      await page.selectOption(element.selector, String(payload.value || ''));
-      result = { element, acted: true };
+      if (!element) {
+        const err = classifyBridgeError(new Error(`findAndSelect: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
+        result = { ok: false, element: null, acted: false, error: err };
+      } else {
+        try {
+          await page.selectOption(element.selector, String(payload.value || ''));
+          result = { ok: true, element, acted: true };
+        } catch (selectErr) {
+          const err = classifyBridgeError(selectErr);
+          result = { ok: false, element, acted: false, error: err };
+        }
+      }
+    } else if (op === 'verify') {
+      const page = await getOrCreatePage(context, false);
+      result = await runVerify(page, payload);
     } else {
       throw new Error(`Unsupported bridge op: ${String(op)}`);
     }
@@ -773,15 +813,81 @@ async function runScanInteractiveOnce(page) {
   return elements;
 }
 
+/**
+ * Classifies a bridge error into one of four tiers:
+ *   A (Transient)  — context/frame/browser gone; immediate retry likely succeeds
+ *   B (Stale)      — element detached/hidden/blocked; re-find the element
+ *   C (Navigation) — page navigated away; caller may need to re-navigate
+ *   D (Permanent)  — invalid selector, timeout, not found; fail immediately
+ *
+ * Returns { tier, code, message, rawMessage, retryable, retryStrategy }.
+ */
+function classifyBridgeError(error) {
+  const rawMessage = String(error && error.message ? error.message : error);
+
+  // --- Tier A: Transient ---
+  if (rawMessage.includes('Execution context was destroyed') ||
+      rawMessage.includes('Cannot find context with specified id')) {
+    return { tier: 'A', code: 'CONTEXT_DESTROYED', message: 'Execution context was destroyed', rawMessage, retryable: true, retryStrategy: 'immediate' };
+  }
+  if (rawMessage.includes('Frame was detached') ||
+      rawMessage.includes('frame was detached')) {
+    return { tier: 'A', code: 'FRAME_DETACHED', message: 'Frame was detached', rawMessage, retryable: true, retryStrategy: 'immediate' };
+  }
+  if (rawMessage.includes('Target page, context or browser has been closed') ||
+      rawMessage.includes('Browser has been closed') ||
+      rawMessage.includes('browser has been closed')) {
+    return { tier: 'A', code: 'BROWSER_CLOSED', message: 'Browser or context has been closed', rawMessage, retryable: true, retryStrategy: 'immediate' };
+  }
+
+  // --- Tier B: Stale ---
+  if (rawMessage.includes('Element is not attached to the DOM') ||
+      rawMessage.includes('is not attached to the DOM')) {
+    return { tier: 'B', code: 'ELEMENT_DETACHED', message: 'Element is not attached to the DOM', rawMessage, retryable: true, retryStrategy: 'refind' };
+  }
+  if (rawMessage.includes('Element is not visible') ||
+      rawMessage.includes('element is not visible')) {
+    return { tier: 'B', code: 'ELEMENT_NOT_VISIBLE', message: 'Element is not visible', rawMessage, retryable: true, retryStrategy: 'refind' };
+  }
+  if (rawMessage.includes('Element is not interactable') ||
+      rawMessage.includes('element is not interactable') ||
+      rawMessage.includes('intercepts pointer events') ||
+      rawMessage.includes('Element is outside of the viewport')) {
+    return { tier: 'B', code: 'ELEMENT_NOT_INTERACTABLE', message: 'Element is not interactable', rawMessage, retryable: true, retryStrategy: 'refind' };
+  }
+
+  // --- Tier C: Navigation ---
+  if (rawMessage.includes('Navigation interrupted') ||
+      rawMessage.includes('Navigating frame was detached') ||
+      rawMessage.includes('navigation was interrupted')) {
+    return { tier: 'C', code: 'PAGE_NAVIGATED', message: 'Navigation interrupted the operation', rawMessage, retryable: false, retryStrategy: 'renavigate' };
+  }
+  if (rawMessage.includes('cross-origin') ||
+      rawMessage.includes('Cross-origin')) {
+    return { tier: 'C', code: 'CROSS_ORIGIN_NAVIGATION', message: 'Cross-origin navigation occurred', rawMessage, retryable: false, retryStrategy: 'renavigate' };
+  }
+
+  // --- Tier D: Permanent ---
+  if (rawMessage.includes('Timeout') || rawMessage.includes('timeout')) {
+    return { tier: 'D', code: 'TIMEOUT', message: 'Operation timed out', rawMessage, retryable: false, retryStrategy: 'fail' };
+  }
+  if (rawMessage.includes('is not a valid selector') ||
+      rawMessage.includes('Failed to execute \'querySelector\'')) {
+    return { tier: 'D', code: 'SELECTOR_INVALID', message: 'Invalid selector', rawMessage, retryable: false, retryStrategy: 'fail' };
+  }
+  if (rawMessage.includes('No node found for selector') ||
+      rawMessage.includes('no element found') ||
+      rawMessage.includes('No element found')) {
+    return { tier: 'D', code: 'ELEMENT_NOT_FOUND', message: 'Element not found', rawMessage, retryable: false, retryStrategy: 'fail' };
+  }
+
+  // Unknown — treat as permanent
+  return { tier: 'D', code: 'UNKNOWN', message: rawMessage, rawMessage, retryable: false, retryStrategy: 'fail' };
+}
+
 function isRecoverableScanError(error) {
-  const message = String(error && error.message ? error.message : error);
-  return (
-    message.includes('Execution context was destroyed') ||
-    message.includes('Cannot find context with specified id') ||
-    message.includes('Frame was detached') ||
-    message.includes('Target page, context or browser has been closed') ||
-    message.includes('Element is not attached to the DOM')
-  );
+  const c = classifyBridgeError(error);
+  return c.tier === 'A' || c.tier === 'B';
 }
 
 async function waitForStableDom(page) {
@@ -2620,6 +2726,165 @@ async function runDomQuery(page, payload) {
     }
   }
   throw lastError;
+}
+
+/**
+ * Coordinate-based click fallback.
+ *
+ * boundingBox is in image-pixel space (DPR-scaled, page-level with scroll offsets baked in).
+ * We need to convert to CSS viewport coordinates for page.mouse.click().
+ *
+ * Conversion:
+ *   effectiveScale = dpr * cssZoom
+ *   viewportX = (bb.x + bb.width / 2) / effectiveScale - scrollX
+ *   viewportY = (bb.y + bb.height / 2) / effectiveScale - scrollY
+ *
+ * After computing coordinates, we validate with document.elementFromPoint() —
+ * walking up 5 ancestors checking tag/text to confirm the right element is at that point.
+ *
+ * Returns { x, y } on success or throws on validation failure.
+ */
+async function coordinateFallbackClick(page, element) {
+  const bb = element.boundingBox;
+  if (!bb || bb.width === 0 || bb.height === 0) {
+    throw new Error('coordinateFallback: boundingBox is empty or missing');
+  }
+
+  // Get DPR and CSS zoom — must match the computation used when building boundingBox
+  const effectiveScale = await page.evaluate(() => {
+    const rawDpr = Number(window.devicePixelRatio) || 1;
+    const dpr = Math.max(1.0, Math.min(4.0, rawDpr));
+    const htmlZoom = Number(getComputedStyle(document.documentElement).zoom) || 1;
+    const bodyZoom = document.body ? (Number(getComputedStyle(document.body).zoom) || 1) : 1;
+    const cssZoom = htmlZoom * bodyZoom;
+    const safeCssZoom = (cssZoom > 0 && isFinite(cssZoom)) ? cssZoom : 1;
+    return dpr * safeCssZoom;
+  });
+
+  // Get current scroll offsets
+  const scroll = await page.evaluate(() => ({
+    x: window.scrollX || window.pageXOffset || 0,
+    y: window.scrollY || window.pageYOffset || 0,
+  }));
+
+  const viewportX = (bb.x + bb.width / 2) / effectiveScale - scroll.x;
+  const viewportY = (bb.y + bb.height / 2) / effectiveScale - scroll.y;
+
+  // Validate with elementFromPoint — walk up 5 ancestors checking tag/text match
+  const valid = await page.evaluate(
+    ({ x, y, expectedTag, expectedText }) => {
+      const el = document.elementFromPoint(x, y);
+      if (!el) return false;
+
+      let current = el;
+      for (let i = 0; i < 5; i++) {
+        if (!current) break;
+        const tag = current.tagName || '';
+        const text = (current.innerText || current.textContent || '').trim().slice(0, 60);
+        // Match if tag matches or text content has overlap
+        if (expectedTag && tag.toLowerCase() === expectedTag.toLowerCase()) return true;
+        if (expectedText && text.length > 0 && text.includes(expectedText.slice(0, 30))) return true;
+        current = current.parentElement;
+      }
+      return false;
+    },
+    { x: viewportX, y: viewportY, expectedTag: element.tag || '', expectedText: element.text || '' }
+  );
+
+  if (!valid) {
+    throw new Error('coordinateFallback: elementFromPoint validation failed — wrong element at computed coordinates');
+  }
+
+  await page.mouse.click(viewportX, viewportY);
+  return { x: viewportX, y: viewportY };
+}
+
+/**
+ * Runs a verification check against the page.
+ *
+ * Handles 7 verification types:
+ *   urlContains, urlMatches, textAppears, selectorGone,
+ *   selectorAppears, ariaState, custom
+ *
+ * Returns { passed: boolean, message: string, durationMs: number }.
+ */
+async function runVerify(page, payload) {
+  const startTs = Date.now();
+  const check = payload.check || payload;
+  const type = check.type;
+  const timeoutMs = normalizeTimeoutMs(check.timeoutMs);
+
+  try {
+    if (type === 'urlContains') {
+      const value = String(check.value || '');
+      await page.waitForURL((url) => String(url).includes(value), { timeout: timeoutMs, waitUntil: 'domcontentloaded' });
+      return { passed: true, message: `URL contains "${value}"`, durationMs: Date.now() - startTs };
+    }
+
+    if (type === 'urlMatches') {
+      const pattern = new RegExp(String(check.pattern || ''));
+      await page.waitForURL(pattern, { timeout: timeoutMs, waitUntil: 'domcontentloaded' });
+      return { passed: true, message: `URL matches ${pattern}`, durationMs: Date.now() - startTs };
+    }
+
+    if (type === 'textAppears') {
+      const text = String(check.text || '');
+      const within = check.within ? String(check.within) : 'body';
+      await page.waitForFunction(
+        ({ text, within }) => {
+          const container = document.querySelector(within);
+          if (!container) return false;
+          return (container.innerText || container.textContent || '').includes(text);
+        },
+        { text, within },
+        { timeout: timeoutMs }
+      );
+      return { passed: true, message: `Text "${text}" appeared`, durationMs: Date.now() - startTs };
+    }
+
+    if (type === 'selectorGone') {
+      const selector = String(check.selector || '');
+      await page.waitForSelector(selector, { state: 'detached', timeout: timeoutMs });
+      return { passed: true, message: `Selector "${selector}" is gone`, durationMs: Date.now() - startTs };
+    }
+
+    if (type === 'selectorAppears') {
+      const selector = String(check.selector || '');
+      const state = normalizeSelectorWaitState(check.state) || 'visible';
+      await page.waitForSelector(selector, { state, timeout: timeoutMs });
+      return { passed: true, message: `Selector "${selector}" appeared (${state})`, durationMs: Date.now() - startTs };
+    }
+
+    if (type === 'ariaState') {
+      const selector = String(check.selector || '');
+      const expected = check.expected || {};
+      await page.waitForFunction(
+        ({ selector, expected }) => {
+          const el = document.querySelector(selector);
+          if (!el) return false;
+          for (const [attr, value] of Object.entries(expected)) {
+            const actual = el.getAttribute(`aria-${attr}`) || el.getAttribute(attr);
+            if (actual !== value) return false;
+          }
+          return true;
+        },
+        { selector, expected },
+        { timeout: timeoutMs }
+      );
+      return { passed: true, message: `ARIA state matches on "${selector}"`, durationMs: Date.now() - startTs };
+    }
+
+    if (type === 'custom') {
+      const evaluator = String(check.evaluator || '');
+      if (!evaluator) throw new Error('verify custom requires evaluator.');
+      await page.waitForFunction(evaluator, { timeout: timeoutMs });
+      return { passed: true, message: 'Custom verification passed', durationMs: Date.now() - startTs };
+    }
+
+    throw new Error(`Unknown verify type: ${String(type)}`);
+  } catch (err) {
+    return { passed: false, message: String(err && err.message ? err.message : err), durationMs: Date.now() - startTs };
+  }
 }
 
 async function runDomQueryFirst(page, findPayload) {
