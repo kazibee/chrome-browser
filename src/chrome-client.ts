@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthConfig } from './auth';
 
-const CDP_WAIT_TIMEOUT_MS = 12_000;
+const CDP_WAIT_TIMEOUT_MS = 8_000;
 const BRIDGE_TIMEOUT_MS = 120_000;
 const BRIDGE_PATH = fileURLToPath(new URL('./cdp-bridge.mjs', import.meta.url));
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
@@ -54,6 +54,13 @@ export interface Zone {
   end: string;
 }
 
+export interface BoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface ElementInfo {
   selector: string;
   tag: string;
@@ -63,6 +70,86 @@ export interface ElementInfo {
   type?: string;
   role?: string;
   label?: string;
+  /** Element bounding box in image-pixel space (DPR-scaled). */
+  boundingBox?: BoundingBox;
+  /** Grid range covering the element (e.g., "A1:C3"). Use with screenshot({ start, end }). */
+  gridRange?: GridRange;
+}
+
+export interface FindResult {
+  selector: string;
+  tag: string;
+  text: string;
+  href?: string;
+  placeholder?: string;
+  type?: string;
+  role?: string;
+  label?: string;
+  /** Element bounding box in image-pixel space (DPR-scaled). */
+  boundingBox?: BoundingBox;
+  /** Grid range covering the element (e.g., "A1:C3"). Use with screenshot({ start, end }). */
+  gridRange?: GridRange;
+  /** Performance tier used (1-4) */
+  tier: 1 | 2 | 3 | 4;
+  /** Time taken in milliseconds */
+  durationMs: number;
+}
+
+export interface FindBySelectorOptions extends WaitStrategyOptions {
+  /** Wait for selector to match before returning (default: true) */
+  waitFor?: boolean;
+  /** Selector wait state (default: 'visible') */
+  state?: SelectorWaitState;
+  /** Return all matches instead of first (default: false) */
+  all?: boolean;
+}
+
+export interface FindByRoleOptions extends WaitStrategyOptions {
+  /** Filter by accessible name (aria-label, innerText) */
+  name?: string | RegExp;
+  /** Filter by state (checked, expanded, etc.) */
+  state?: Record<string, boolean>;
+  /** Return all matches (default: false) */
+  all?: boolean;
+}
+
+export interface FindByLabelOptions extends WaitStrategyOptions {
+  /** Match exact text (default: false = substring match) */
+  exact?: boolean;
+  /** Case sensitive (default: false) */
+  caseSensitive?: boolean;
+  /** Return all matches (default: false) */
+  all?: boolean;
+}
+
+export interface FindByTextOptions extends WaitStrategyOptions {
+  /** Element tag to filter (e.g., 'button', 'a') */
+  tag?: string;
+  /** Match exact text (default: false = substring match) */
+  exact?: boolean;
+  /** Case sensitive (default: false) */
+  caseSensitive?: boolean;
+  /** Return all matches (default: false) */
+  all?: boolean;
+}
+
+export interface FindQuery {
+  mode: 'selector' | 'role' | 'label' | 'text';
+  query: string;
+  options?: Record<string, unknown>;
+  waitFor?: boolean;
+  state?: SelectorWaitState;
+}
+
+export interface FindAndClickOptions extends WaitStrategyOptions {}
+
+export interface FindAndTypeOptions extends WaitStrategyOptions {}
+
+export interface FindAndSelectOptions extends WaitStrategyOptions {}
+
+export interface FindAndActResult {
+  element: FindResult;
+  acted: boolean;
 }
 
 export interface ZoneResult {
@@ -90,7 +177,10 @@ export type Action =
   | { type: 'waitForSelector'; selector: string; state?: SelectorWaitState; timeoutMs?: number }
   | { type: 'waitForUrl'; urlIncludes?: string; urlMatches?: string; timeoutMs?: number }
   | { type: 'scroll'; direction: 'up' | 'down'; amount?: number }
-  | { type: 'navigate'; url: string; waitUntil?: PageLoadState; timeoutMs?: number };
+  | { type: 'navigate'; url: string; waitUntil?: PageLoadState; timeoutMs?: number }
+  | { type: 'waitForStable'; maxMutations?: number; stabilityWindowMs?: number; maxObservationMs?: number }
+  | { type: 'waitForCustom'; evaluator: string; timeoutMs?: number }
+  | { type: 'scrollIntoView'; selector: string };
 
 export interface TabInfo {
   id: string;
@@ -208,34 +298,246 @@ type LabelsPromptMode = 'full' | 'zone';
 
 export function createChromeBrowserClient(config: AuthConfig) {
   return {
+    /** Returns the configured Chrome executable path. */
     getExecutablePath: (): string => config.chromePath,
+    /** Returns whether headless mode is the default. */
     isHeadlessDefault: (): boolean => config.headless,
+    /** Returns the CDP WebSocket URL used for browser communication. */
     getCdpUrl: (): string => getCdpUrl(config),
+    /** Checks if the Chrome executable exists and is runnable. */
     checkExecutable: (): ExecutableStatus => checkExecutable(config.chromePath),
+    /** Launches Chrome and optionally navigates to a URL. Action tool. */
     launch: async (options?: LaunchOptions): Promise<LaunchResult> => launch(config, options),
+    /** Navigates the active tab to a URL. Action tool. */
     open: async (url: string, options?: OpenOptions): Promise<LaunchResult> => open(config, url, options),
+    /** Ensures a persistent Chrome daemon is running. Action tool. Idempotent — safe to call repeatedly. */
     launchDaemon: async (): Promise<LaunchResult> => launchDaemon(config),
+    /** Lists all open browser tabs. */
     listTabs: async (): Promise<TabInfo[]> => listTabs(config),
+    /**
+     * Captures a full screenshot WITH grid overlay — the "context" channel.
+     * Shows the complete page as-is: layout, images, text, and controls together.
+     * Use this to understand WHERE you are and WHAT the page looks like overall.
+     * INTERNAL tool — do NOT use for presenting visuals to the user.
+     * Use screenshot() instead for user-facing captures.
+     */
     gridScreenshot: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<Buffer> => gridScreenshot(config, options, wait),
+    /**
+     * Returns a base64-encoded screenshot WITH grid overlay.
+     * INTERNAL tool — do NOT use for user-facing presentation.
+     */
     gridScreenshotBase64: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<string> =>
       gridScreenshotBase64(config, options, wait),
+    /**
+     * Saves a grid-overlaid screenshot to disk.
+     * INTERNAL tool — for navigation and zone mapping only.
+     * Use saveScreenshot() for user-facing captures.
+     */
     saveGridScreenshot: async (outputPath: string, options?: GridRange, wait?: WaitStrategyOptions): Promise<SavedScreenshot> =>
       saveGridScreenshot(config, outputPath, options, wait),
-    /** Captures a full grid screenshot and requests Gemini to label key UI regions and elements. */
+    /**
+     * Captures a text-only screenshot WITH grid overlay — the "reading" channel.
+     * Shows ONLY text-containing regions (paragraphs, headings, labels, list items)
+     * cropped from the page and placed on a white canvas. Everything else is blank.
+     * Use this to understand WHAT THE PAGE SAYS — read content, summarize sections,
+     * identify headings and descriptions without visual noise from icons or controls.
+     * INTERNAL tool — grid overlay is identical to gridScreenshot().
+     */
+    gridScreenshotText: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<Buffer> =>
+      gridScreenshotText(config, options, wait),
+    /**
+     * Returns a base64-encoded text-only screenshot WITH grid overlay.
+     * INTERNAL tool.
+     */
+    gridScreenshotTextBase64: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<string> =>
+      gridScreenshotTextBase64(config, options, wait),
+    /**
+     * Saves a text-only grid screenshot to disk. INTERNAL tool.
+     */
+    saveGridScreenshotText: async (outputPath: string, options?: GridRange, wait?: WaitStrategyOptions): Promise<SavedScreenshot> =>
+      saveGridScreenshotText(config, outputPath, options, wait),
+    /**
+     * Captures an interactive-elements-only screenshot WITH grid overlay — the "action" channel.
+     * Shows ONLY interactive elements (buttons, links, inputs, selects, ARIA controls)
+     * cropped from the page and placed on a white canvas. Everything else is blank.
+     * Use this to understand WHAT YOU CAN DO — see the full action space, identify
+     * clickable controls, form fields, and navigation options without content noise.
+     * INTERNAL tool — grid overlay is identical to gridScreenshot().
+     */
+    gridScreenshotInteractive: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<Buffer> =>
+      gridScreenshotInteractive(config, options, wait),
+    /**
+     * Returns a base64-encoded interactive-elements-only screenshot WITH grid overlay.
+     * INTERNAL tool.
+     */
+    gridScreenshotInteractiveBase64: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<string> =>
+      gridScreenshotInteractiveBase64(config, options, wait),
+    /**
+     * Saves an interactive-elements grid screenshot to disk. INTERNAL tool.
+     */
+    saveGridScreenshotInteractive: async (outputPath: string, options?: GridRange, wait?: WaitStrategyOptions): Promise<SavedScreenshot> =>
+      saveGridScreenshotInteractive(config, outputPath, options, wait),
+    /**
+     * Captures a clean screenshot WITHOUT grid overlay.
+     * USER-FACING tool — use this when the user asks to "look at",
+     * "show me", or "review" a page. Suitable for design review and QA.
+     */
+    screenshot: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<Buffer> =>
+      screenshotClean(config, options, wait),
+    /**
+     * Returns a base64-encoded clean screenshot WITHOUT grid overlay.
+     * USER-FACING tool — for presenting page visuals to the user.
+     */
+    screenshotBase64: async (options?: GridRange, wait?: WaitStrategyOptions): Promise<string> =>
+      screenshotCleanBase64(config, options, wait),
+    /**
+     * Saves a clean screenshot (no grid) to disk.
+     * USER-FACING tool — for design review, QA verification, and
+     * any scenario where the user needs to see the actual page appearance.
+     */
+    saveScreenshot: async (outputPath: string, options?: GridRange, wait?: WaitStrategyOptions): Promise<SavedScreenshot> =>
+      saveScreenshotClean(config, outputPath, options, wait),
+    /**
+     * Captures a clean text-only screenshot WITHOUT grid overlay.
+     * Shows only text-containing regions on a white canvas.
+     * USER-FACING tool — use to show the user isolated text content from a page.
+     */
+    screenshotText: async (wait?: WaitStrategyOptions): Promise<Buffer> =>
+      screenshotText(config, wait),
+    /**
+     * Returns a base64-encoded clean text-only screenshot WITHOUT grid overlay.
+     * USER-FACING tool.
+     */
+    screenshotTextBase64: async (wait?: WaitStrategyOptions): Promise<string> =>
+      screenshotTextBase64(config, wait),
+    /**
+     * Saves a clean text-only screenshot to disk. USER-FACING tool.
+     */
+    saveScreenshotText: async (outputPath: string, wait?: WaitStrategyOptions): Promise<SavedScreenshot> =>
+      saveScreenshotText(config, outputPath, wait),
+    /**
+     * Captures a clean interactive-elements-only screenshot WITHOUT grid overlay.
+     * Shows only interactive elements on a white canvas.
+     * USER-FACING tool — use to show the user what controls exist on a page.
+     */
+    screenshotInteractive: async (wait?: WaitStrategyOptions): Promise<Buffer> =>
+      screenshotInteractive(config, wait),
+    /**
+     * Returns a base64-encoded clean interactive-elements-only screenshot WITHOUT grid overlay.
+     * USER-FACING tool.
+     */
+    screenshotInteractiveBase64: async (wait?: WaitStrategyOptions): Promise<string> =>
+      screenshotInteractiveBase64(config, wait),
+    /**
+     * Saves a clean interactive-elements-only screenshot to disk. USER-FACING tool.
+     */
+    saveScreenshotInteractive: async (outputPath: string, wait?: WaitStrategyOptions): Promise<SavedScreenshot> =>
+      saveScreenshotInteractive(config, outputPath, wait),
+    /**
+     * Captures a full grid screenshot and requests Gemini to label key UI regions and elements.
+     * INTERNAL tool — requires GEMINI_API_KEY. Use for vision-assisted navigation (Tier 3-4).
+     * ~90s per call. Do not use for user-facing presentation.
+     */
     labels: async (options?: LabelsOptions): Promise<UiLabelsResult> => labels(config, options),
-    /** Captures a full grid screenshot and requests a minimal overview (ranges + descriptions). */
+    /**
+     * Captures a full-page grid screenshot and returns a minimal region overview.
+     * INTERNAL tool — requires GEMINI_API_KEY. Use as a quick page map before
+     * deeper analysis with labelsInRange. Returns gridSpace: "page".
+     */
     labelsOverview: async (options?: LabelsOverviewOptions): Promise<UiOverviewResult> => labelsOverview(config, options),
-    /** Captures a grid screenshot cropped to a range and asks Gemini for zone-focused labels. */
+    /**
+     * Captures a cropped grid screenshot of a specific zone and asks Gemini for focused labels.
+     * INTERNAL tool — requires GEMINI_API_KEY. Use for deep analysis of a suspicious area.
+     * Returns gridSpace: "viewport".
+     */
     labelsInRange: async (range: GridRange, options?: ZoneLabelsOptions): Promise<UiLabelsResult> =>
       labelsInRange(config, range, options),
-    /** Runs zone-focused Gemini labels for each range and returns per-zone results. */
+    /**
+     * Runs labelsInRange for multiple zones and returns per-zone results.
+     * INTERNAL tool — requires GEMINI_API_KEY. ~90s per zone.
+     */
     labelsByZones: async (zones: Zone[], options?: ZoneLabelsOptions): Promise<ZoneLabelsResult[]> =>
       labelsByZones(config, zones, options),
-    /** Finds one best-matching interactive element for a query using Gemini + grid screenshot analysis. */
+    /**
+     * Finds one best-matching interactive element using Gemini + grid screenshot analysis.
+     * INTERNAL tool — requires GEMINI_API_KEY. 90-180s. Use only after DOM queries
+     * (findBySelector/findByRole/findByLabel/findByText) fail.
+     */
     findInteractiveElement: async (query: string, options?: FindInteractiveElementOptions): Promise<UiInteractiveElement> =>
       findInteractiveElement(config, query, options),
+    /**
+     * Find element by CSS selector. Query tool (Tier 1: ~0.1s).
+     * Fastest option when the selector is known. Prefer this when you have
+     * an ID, class, or attribute selector. After finding, use scrollIntoView
+     * to bring the element into the viewport if visual inspection is needed.
+     */
+    findBySelector: async (selector: string, options?: FindBySelectorOptions): Promise<FindResult | FindResult[] | undefined> =>
+      findBySelector(config, selector, options),
+    /**
+     * Find element by ARIA role. Query tool (Tier 2: ~0.2-0.5s).
+     * Preferred for semantic queries — buttons, links, inputs, navigation landmarks.
+     * After finding, use scrollIntoView if the user wants to see the element.
+     */
+    findByRole: async (role: string, options?: FindByRoleOptions): Promise<FindResult | FindResult[] | undefined> =>
+      findByRole(config, role, options),
+    /**
+     * Find element by aria-label or associated label text. Query tool (Tier 2: ~0.2-0.5s).
+     * Best for form inputs that have visible or accessible labels.
+     * After finding, use scrollIntoView if the user wants to see the element.
+     */
+    findByLabel: async (labelText: string | RegExp, options?: FindByLabelOptions): Promise<FindResult | FindResult[] | undefined> =>
+      findByLabel(config, labelText, options),
+    /**
+     * Find element by visible text content. Query tool (Tier 2: ~0.2-0.5s).
+     * Good for buttons, links, and headings with known text.
+     * After finding, use scrollIntoView if the user wants to see the element.
+     */
+    findByText: async (text: string | RegExp, options?: FindByTextOptions): Promise<FindResult | FindResult[] | undefined> =>
+      findByText(config, text, options),
+    /**
+     * Extracts interactive DOM elements from specified grid zones.
+     * INTERNAL tool — returns deterministic selectors for elements found
+     * within coordinate ranges. Use with grid screenshots and vision APIs.
+     * Pass matching coordinateSpace from labels/labelsOverview results.
+     */
     scanZones: async (zones: Zone[], options?: ScanZonesOptions): Promise<ZoneResult[]> => scanZones(config, zones, options),
+    /**
+     * Scans the ENTIRE page for all interactive elements and returns each with an
+     * ID-anchored CSS selector (e.g. `div#login-form > div:nth-of-type(2) > button`).
+     * Each selector walks up from the element to the nearest ancestor with an `id`,
+     * then builds the child-combinator path back down.
+     * INTERNAL tool — use to get the full action space as structured data.
+     * Pairs with gridScreenshotInteractive() which shows the visual representation.
+     * Returns selectors ready for use with execute().
+     */
+    scanInteractive: async (options?: WaitStrategyOptions): Promise<ElementInfo[]> => scanInteractive(config, options),
+    /**
+     * Executes a browser action (click, type, scroll, submit, navigate, wait, scrollIntoView).
+     * Action tool — use for all page interactions. Supports batching related operations
+     * within safety constraints. Use scrollIntoView to bring a found element into the
+     * viewport before taking a clean screenshot.
+     */
     execute: async (action: Action): Promise<void> => execute(config, action),
+    /**
+     * Atomically finds an element and clicks it in a single bridge invocation.
+     * Eliminates the 200-600ms gap between separate find and execute calls,
+     * preventing element detachment on high-churn SPA pages.
+     */
+    findAndClick: async (find: FindQuery, options?: FindAndClickOptions): Promise<FindAndActResult> =>
+      findAndClick(config, find, options),
+    /**
+     * Atomically finds an element and types text into it in a single bridge invocation.
+     * Uses native value setter to bypass React's interceptor, dispatching input+change events.
+     * Eliminates the inter-bridge gap that causes detachment on high-churn pages.
+     */
+    findAndType: async (find: FindQuery, text: string, options?: FindAndTypeOptions): Promise<FindAndActResult> =>
+      findAndType(config, find, text, options),
+    /**
+     * Atomically finds a select element and sets its value in a single bridge invocation.
+     * Eliminates the inter-bridge gap that causes detachment on high-churn pages.
+     */
+    findAndSelect: async (find: FindQuery, value: string, options?: FindAndSelectOptions): Promise<FindAndActResult> =>
+      findAndSelect(config, find, value, options),
   };
 }
 
@@ -407,6 +709,248 @@ async function saveGridScreenshot(
     outputPath: resolvedPath,
     sizeBytes: image.byteLength,
   };
+}
+
+/** Captures a text-only grid screenshot (viewport crop). */
+async function gridScreenshotText(config: AuthConfig, options?: GridRange, wait: WaitStrategyOptions = {}): Promise<Buffer> {
+  return gridScreenshotTextInternal(config, options, false, wait);
+}
+
+/** Runs the gridScreenshotText bridge op with configurable fullPage flag. */
+async function gridScreenshotTextInternal(
+  config: AuthConfig,
+  options?: GridRange,
+  fullPage = false,
+  wait: WaitStrategyOptions = {},
+): Promise<Buffer> {
+  await launchDaemon(config);
+  const result = await runBridge(config, {
+    op: 'gridScreenshotText',
+    start: options?.start,
+    end: options?.end,
+    fullPage,
+    waitUntil: wait.waitUntil,
+    timeoutMs: wait.timeoutMs,
+  });
+
+  if (!result?.imageBase64) {
+    throw new Error('Bridge returned no image for gridScreenshotText.');
+  }
+
+  return Buffer.from(String(result.imageBase64), 'base64');
+}
+
+/** Returns a base64-encoded text-only grid screenshot. */
+async function gridScreenshotTextBase64(config: AuthConfig, options?: GridRange, wait: WaitStrategyOptions = {}): Promise<string> {
+  const image = await gridScreenshotText(config, options, wait);
+  return image.toString('base64');
+}
+
+/** Returns a base64-encoded text-only grid screenshot with configurable fullPage flag. */
+async function gridScreenshotTextBase64Internal(
+  config: AuthConfig,
+  options?: GridRange,
+  fullPage = false,
+  wait: WaitStrategyOptions = {},
+): Promise<string> {
+  const image = await gridScreenshotTextInternal(config, options, fullPage, wait);
+  return image.toString('base64');
+}
+
+/** Saves a text-only grid screenshot to disk. */
+async function saveGridScreenshotText(
+  config: AuthConfig,
+  outputPath: string,
+  options?: GridRange,
+  wait: WaitStrategyOptions = {},
+): Promise<SavedScreenshot> {
+  const image = await gridScreenshotText(config, options, wait);
+  const resolvedPath = resolve(outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  writeFileSync(resolvedPath, image);
+  return {
+    outputPath: resolvedPath,
+    sizeBytes: image.byteLength,
+  };
+}
+
+/** Captures an interactive-elements-only grid screenshot (viewport crop). */
+async function gridScreenshotInteractive(config: AuthConfig, options?: GridRange, wait: WaitStrategyOptions = {}): Promise<Buffer> {
+  return gridScreenshotInteractiveInternal(config, options, false, wait);
+}
+
+/** Runs the gridScreenshotInteractive bridge op with configurable fullPage flag. */
+async function gridScreenshotInteractiveInternal(
+  config: AuthConfig,
+  options?: GridRange,
+  fullPage = false,
+  wait: WaitStrategyOptions = {},
+): Promise<Buffer> {
+  await launchDaemon(config);
+  const result = await runBridge(config, {
+    op: 'gridScreenshotInteractive',
+    start: options?.start,
+    end: options?.end,
+    fullPage,
+    waitUntil: wait.waitUntil,
+    timeoutMs: wait.timeoutMs,
+  });
+
+  if (!result?.imageBase64) {
+    throw new Error('Bridge returned no image for gridScreenshotInteractive.');
+  }
+
+  return Buffer.from(String(result.imageBase64), 'base64');
+}
+
+/** Returns a base64-encoded interactive-elements-only grid screenshot. */
+async function gridScreenshotInteractiveBase64(config: AuthConfig, options?: GridRange, wait: WaitStrategyOptions = {}): Promise<string> {
+  const image = await gridScreenshotInteractive(config, options, wait);
+  return image.toString('base64');
+}
+
+/** Returns a base64-encoded interactive-elements-only grid screenshot with configurable fullPage flag. */
+async function gridScreenshotInteractiveBase64Internal(
+  config: AuthConfig,
+  options?: GridRange,
+  fullPage = false,
+  wait: WaitStrategyOptions = {},
+): Promise<string> {
+  const image = await gridScreenshotInteractiveInternal(config, options, fullPage, wait);
+  return image.toString('base64');
+}
+
+/** Saves an interactive-elements-only grid screenshot to disk. */
+async function saveGridScreenshotInteractive(
+  config: AuthConfig,
+  outputPath: string,
+  options?: GridRange,
+  wait: WaitStrategyOptions = {},
+): Promise<SavedScreenshot> {
+  const image = await gridScreenshotInteractive(config, options, wait);
+  const resolvedPath = resolve(outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  writeFileSync(resolvedPath, image);
+  return {
+    outputPath: resolvedPath,
+    sizeBytes: image.byteLength,
+  };
+}
+
+async function screenshotClean(config: AuthConfig, options?: GridRange, wait: WaitStrategyOptions = {}): Promise<Buffer> {
+  return screenshotCleanInternal(config, options, false, wait);
+}
+
+async function screenshotCleanInternal(
+  config: AuthConfig,
+  options?: GridRange,
+  fullPage = false,
+  wait: WaitStrategyOptions = {},
+): Promise<Buffer> {
+  await launchDaemon(config);
+  const result = await runBridge(config, {
+    op: 'screenshot',
+    start: options?.start,
+    end: options?.end,
+    fullPage,
+    waitUntil: wait.waitUntil,
+    timeoutMs: wait.timeoutMs,
+  });
+
+  if (!result?.imageBase64) {
+    throw new Error('Bridge returned no image for screenshot.');
+  }
+
+  return Buffer.from(String(result.imageBase64), 'base64');
+}
+
+async function screenshotCleanBase64(config: AuthConfig, options?: GridRange, wait: WaitStrategyOptions = {}): Promise<string> {
+  const image = await screenshotClean(config, options, wait);
+  return image.toString('base64');
+}
+
+async function saveScreenshotClean(
+  config: AuthConfig,
+  outputPath: string,
+  options?: GridRange,
+  wait: WaitStrategyOptions = {},
+): Promise<SavedScreenshot> {
+  const image = await screenshotClean(config, options, wait);
+  const resolvedPath = resolve(outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  writeFileSync(resolvedPath, image);
+  return {
+    outputPath: resolvedPath,
+    sizeBytes: image.byteLength,
+  };
+}
+
+/** Captures a clean text-only screenshot WITHOUT grid overlay. */
+async function screenshotText(config: AuthConfig, wait: WaitStrategyOptions = {}): Promise<Buffer> {
+  await launchDaemon(config);
+  const result = await runBridge(config, {
+    op: 'screenshotText',
+    fullPage: false,
+    waitUntil: wait.waitUntil,
+    timeoutMs: wait.timeoutMs,
+  });
+  if (!result?.imageBase64) {
+    throw new Error('Bridge returned no image for screenshotText.');
+  }
+  return Buffer.from(String(result.imageBase64), 'base64');
+}
+
+/** Returns a base64-encoded clean text-only screenshot. */
+async function screenshotTextBase64(config: AuthConfig, wait: WaitStrategyOptions = {}): Promise<string> {
+  const image = await screenshotText(config, wait);
+  return image.toString('base64');
+}
+
+/** Saves a clean text-only screenshot to disk. */
+async function saveScreenshotText(
+  config: AuthConfig,
+  outputPath: string,
+  wait: WaitStrategyOptions = {},
+): Promise<SavedScreenshot> {
+  const image = await screenshotText(config, wait);
+  const resolvedPath = resolve(outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  writeFileSync(resolvedPath, image);
+  return { outputPath: resolvedPath, sizeBytes: image.byteLength };
+}
+
+/** Captures a clean interactive-elements-only screenshot WITHOUT grid overlay. */
+async function screenshotInteractive(config: AuthConfig, wait: WaitStrategyOptions = {}): Promise<Buffer> {
+  await launchDaemon(config);
+  const result = await runBridge(config, {
+    op: 'screenshotInteractive',
+    fullPage: false,
+    waitUntil: wait.waitUntil,
+    timeoutMs: wait.timeoutMs,
+  });
+  if (!result?.imageBase64) {
+    throw new Error('Bridge returned no image for screenshotInteractive.');
+  }
+  return Buffer.from(String(result.imageBase64), 'base64');
+}
+
+/** Returns a base64-encoded clean interactive-elements-only screenshot. */
+async function screenshotInteractiveBase64(config: AuthConfig, wait: WaitStrategyOptions = {}): Promise<string> {
+  const image = await screenshotInteractive(config, wait);
+  return image.toString('base64');
+}
+
+/** Saves a clean interactive-elements-only screenshot to disk. */
+async function saveScreenshotInteractive(
+  config: AuthConfig,
+  outputPath: string,
+  wait: WaitStrategyOptions = {},
+): Promise<SavedScreenshot> {
+  const image = await screenshotInteractive(config, wait);
+  const resolvedPath = resolve(outputPath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+  writeFileSync(resolvedPath, image);
+  return { outputPath: resolvedPath, sizeBytes: image.byteLength };
 }
 
 async function labels(config: AuthConfig, options: LabelsOptions = {}): Promise<UiLabelsResult> {
@@ -747,6 +1291,18 @@ async function scanZones(config: AuthConfig, zones: Zone[], options: ScanZonesOp
   });
 
   return (result?.zones ?? []) as ZoneResult[];
+}
+
+/** Scans the entire page for interactive elements and returns ID-anchored selectors. */
+async function scanInteractive(config: AuthConfig, options: WaitStrategyOptions = {}): Promise<ElementInfo[]> {
+  await launchDaemon(config);
+  const result = await runBridge(config, {
+    op: 'scanInteractive',
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  return (result?.elements ?? []) as ElementInfo[];
 }
 
 async function execute(config: AuthConfig, action: Action): Promise<void> {
@@ -1205,4 +1761,242 @@ async function runBridge(config: AuthConfig, payload: Record<string, unknown>): 
       });
     });
   });
+}
+
+async function findBySelector(
+  config: AuthConfig,
+  selector: string,
+  options: FindBySelectorOptions = {},
+): Promise<FindResult | FindResult[] | undefined> {
+  const startTime = Date.now();
+  const normalizedSelector = selector.trim();
+  if (!normalizedSelector) {
+    throw new Error('findBySelector() requires a non-empty selector.');
+  }
+
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'domQuery',
+    mode: 'selector',
+    query: normalizedSelector,
+    waitFor: options.waitFor !== false,
+    state: options.state || 'visible',
+    all: options.all || false,
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  const elements = (result?.elements ?? []) as FindResult[];
+  const duration = Date.now() - startTime;
+
+  elements.forEach((el) => {
+    el.tier = 1;
+    el.durationMs = duration;
+  });
+
+  if (elements.length === 0) {
+    return options.all ? [] : undefined;
+  }
+
+  return options.all ? elements : elements[0];
+}
+
+async function findByRole(
+  config: AuthConfig,
+  role: string,
+  options: FindByRoleOptions = {},
+): Promise<FindResult | FindResult[] | undefined> {
+  const startTime = Date.now();
+  const normalizedRole = role.trim();
+  if (!normalizedRole) {
+    throw new Error('findByRole() requires a non-empty role.');
+  }
+
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'domQuery',
+    mode: 'role',
+    query: normalizedRole,
+    options: {
+      name: options.name,
+      state: options.state,
+      all: options.all || false,
+    },
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  const elements = (result?.elements ?? []) as FindResult[];
+  const duration = Date.now() - startTime;
+
+  elements.forEach((el) => {
+    el.tier = 2;
+    el.durationMs = duration;
+  });
+
+  if (elements.length === 0) {
+    return options.all ? [] : undefined;
+  }
+
+  return options.all ? elements : elements[0];
+}
+
+async function findByLabel(
+  config: AuthConfig,
+  labelText: string | RegExp,
+  options: FindByLabelOptions = {},
+): Promise<FindResult | FindResult[] | undefined> {
+  const startTime = Date.now();
+  const query = labelText instanceof RegExp ? labelText.source : labelText.trim();
+  if (!query) {
+    throw new Error('findByLabel() requires a non-empty label.');
+  }
+
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'domQuery',
+    mode: 'label',
+    query,
+    options: {
+      isRegex: labelText instanceof RegExp,
+      exact: options.exact || false,
+      caseSensitive: options.caseSensitive || false,
+      all: options.all || false,
+    },
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  const elements = (result?.elements ?? []) as FindResult[];
+  const duration = Date.now() - startTime;
+
+  elements.forEach((el) => {
+    el.tier = 2;
+    el.durationMs = duration;
+  });
+
+  if (elements.length === 0) {
+    return options.all ? [] : undefined;
+  }
+
+  return options.all ? elements : elements[0];
+}
+
+async function findByText(
+  config: AuthConfig,
+  text: string | RegExp,
+  options: FindByTextOptions = {},
+): Promise<FindResult | FindResult[] | undefined> {
+  const startTime = Date.now();
+  const query = text instanceof RegExp ? text.source : text.trim();
+  if (!query) {
+    throw new Error('findByText() requires a non-empty text.');
+  }
+
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'domQuery',
+    mode: 'text',
+    query,
+    options: {
+      tag: options.tag,
+      isRegex: text instanceof RegExp,
+      exact: options.exact || false,
+      caseSensitive: options.caseSensitive || false,
+      all: options.all || false,
+    },
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  const elements = (result?.elements ?? []) as FindResult[];
+  const duration = Date.now() - startTime;
+
+  elements.forEach((el) => {
+    el.tier = 2;
+    el.durationMs = duration;
+  });
+
+  if (elements.length === 0) {
+    return options.all ? [] : undefined;
+  }
+
+  return options.all ? elements : elements[0];
+}
+
+async function findAndClick(
+  config: AuthConfig,
+  find: FindQuery,
+  options: FindAndClickOptions = {},
+): Promise<FindAndActResult> {
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'findAndClick',
+    find: {
+      mode: find.mode,
+      query: find.query,
+      options: find.options,
+      waitFor: find.waitFor,
+      state: find.state,
+    },
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  return result as unknown as FindAndActResult;
+}
+
+async function findAndType(
+  config: AuthConfig,
+  find: FindQuery,
+  text: string,
+  options: FindAndTypeOptions = {},
+): Promise<FindAndActResult> {
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'findAndType',
+    find: {
+      mode: find.mode,
+      query: find.query,
+      options: find.options,
+      waitFor: find.waitFor,
+      state: find.state,
+    },
+    text,
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  return result as unknown as FindAndActResult;
+}
+
+async function findAndSelect(
+  config: AuthConfig,
+  find: FindQuery,
+  value: string,
+  options: FindAndSelectOptions = {},
+): Promise<FindAndActResult> {
+  await launchDaemon(config);
+
+  const result = await runBridge(config, {
+    op: 'findAndSelect',
+    find: {
+      mode: find.mode,
+      query: find.query,
+      options: find.options,
+      waitFor: find.waitFor,
+      state: find.state,
+    },
+    value,
+    waitUntil: options.waitUntil,
+    timeoutMs: options.timeoutMs,
+  });
+
+  return result as unknown as FindAndActResult;
 }
