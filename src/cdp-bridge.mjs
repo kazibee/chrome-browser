@@ -6,6 +6,173 @@ const CELL_SIZE = 100;
 const LABEL_MARGIN = 50;
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000;
 
+/**
+ * Handles a single bridge operation against the given browser context.
+ * Extracted from main() so that both one-shot and sidecar modes share
+ * the same routing logic.
+ *
+ * @param {import('playwright').BrowserContext} context
+ * @param {object} payload - The operation payload ({ op, ...params })
+ * @returns {Promise<object>} The result object for the operation
+ */
+async function handleOperation(context, payload) {
+  const op = payload.op;
+  let result = {};
+
+  if (op === 'navigate') {
+    const page = await getOrCreatePage(context, Boolean(payload.newWindow));
+    const url = String(payload.url || '');
+    const timeout = normalizeTimeoutMsOrUndefined(payload.timeoutMs);
+    const requested = normalizeLoadState(payload.waitUntil);
+    // Build a fallback chain: requested state -> load -> domcontentloaded.
+    // De-duplicate so we never retry with the same waitUntil twice.
+    const chain = [requested];
+    if (requested !== 'load') chain.push('load');
+    if (requested !== 'domcontentloaded') chain.push('domcontentloaded');
+
+    let lastErr;
+    for (const waitUntil of chain) {
+      try {
+        await page.goto(url, { waitUntil, timeout });
+        lastErr = null;
+        break;
+      } catch (err) {
+        const msg = String(err?.message || '');
+        const isRetriable =
+          msg.includes('Timeout') ||
+          msg.includes('timeout') ||
+          msg.includes('ERR_BLOCKED_BY_RESPONSE') ||
+          msg.includes('net::ERR_');
+        if (!isRetriable || waitUntil === chain[chain.length - 1]) {
+          throw err;
+        }
+        lastErr = err;
+      }
+    }
+    if (lastErr) throw lastErr;
+    // Inject persistent observer after successful navigation so it
+    // starts indexing interactive elements immediately.
+    await ensureObserver(page);
+    result = { ok: true };
+  } else if (op === 'execute') {
+    const page = await getOrCreatePage(context, false);
+    await runExecute(page, payload.action || {});
+    result = { ok: true };
+  } else if (op === 'scanZones') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const zones = await runScanZones(page, payload.zones || [], normalizeCoordinateSpace(payload.coordinateSpace));
+    result = { zones };
+  } else if (op === 'gridScreenshot') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const image = await runGridScreenshot(page, payload.start, payload.end, Boolean(payload.fullPage));
+    result = { imageBase64: image.toString('base64') };
+  } else if (op === 'gridScreenshotText') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const image = await runGridScreenshotText(page, payload.start, payload.end, Boolean(payload.fullPage));
+    result = { imageBase64: image.toString('base64') };
+  } else if (op === 'gridScreenshotInteractive') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const image = await runGridScreenshotInteractive(page, payload.start, payload.end, Boolean(payload.fullPage));
+    result = { imageBase64: image.toString('base64') };
+  } else if (op === 'screenshotText') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const image = await runScreenshotText(page, Boolean(payload.fullPage));
+    result = { imageBase64: image.toString('base64') };
+  } else if (op === 'screenshotInteractive') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const image = await runScreenshotInteractive(page, Boolean(payload.fullPage));
+    result = { imageBase64: image.toString('base64') };
+  } else if (op === 'scanInteractive') {
+    const page = await getOrCreatePage(context, false);
+    // No load-state wait — scanInteractive reads whatever DOM exists right now.
+    // The content is already there; waiting for load/networkidle causes timeouts
+    // on pages with streaming resources.
+    const elements = await runScanInteractive(page);
+    result = { elements };
+  } else if (op === 'screenshot') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const image = await runScreenshot(page, payload.start, payload.end, Boolean(payload.fullPage));
+    result = { imageBase64: image.toString('base64') };
+  } else if (op === 'domQuery') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const elements = await runDomQuery(page, payload);
+    result = { elements };
+  } else if (op === 'findAndClick') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const element = await runDomQueryFirst(page, payload.find);
+    if (!element) {
+      const err = classifyBridgeError(new Error(`findAndClick: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
+      result = { ok: false, element: null, acted: false, error: err };
+    } else {
+      try {
+        await page.click(element.selector);
+        result = { ok: true, element, acted: true };
+      } catch (clickErr) {
+        if (payload.coordinateFallback && element.boundingBox) {
+          try {
+            const coordResult = await coordinateFallbackClick(page, element);
+            result = { ok: true, element, acted: true, coordinatesUsed: coordResult };
+          } catch (fallbackErr) {
+            const err = classifyBridgeError(fallbackErr);
+            result = { ok: false, element, acted: false, error: err };
+          }
+        } else {
+          const err = classifyBridgeError(clickErr);
+          result = { ok: false, element, acted: false, error: err };
+        }
+      }
+    }
+  } else if (op === 'findAndType') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const element = await runDomQueryFirst(page, payload.find);
+    if (!element) {
+      const err = classifyBridgeError(new Error(`findAndType: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
+      result = { ok: false, element: null, acted: false, error: err };
+    } else {
+      try {
+        await atomicSetValue(page, element.selector, String(payload.text || ''));
+        result = { ok: true, element, acted: true };
+      } catch (typeErr) {
+        const err = classifyBridgeError(typeErr);
+        result = { ok: false, element, acted: false, error: err };
+      }
+    }
+  } else if (op === 'findAndSelect') {
+    const page = await getOrCreatePage(context, false);
+    await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
+    const element = await runDomQueryFirst(page, payload.find);
+    if (!element) {
+      const err = classifyBridgeError(new Error(`findAndSelect: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
+      result = { ok: false, element: null, acted: false, error: err };
+    } else {
+      try {
+        await page.selectOption(element.selector, String(payload.value || ''));
+        result = { ok: true, element, acted: true };
+      } catch (selectErr) {
+        const err = classifyBridgeError(selectErr);
+        result = { ok: false, element, acted: false, error: err };
+      }
+    }
+  } else if (op === 'verify') {
+    const page = await getOrCreatePage(context, false);
+    result = await runVerify(page, payload);
+  } else {
+    throw new Error(`Unsupported bridge op: ${String(op)}`);
+  }
+
+  return result;
+}
+
 async function main() {
   const raw = process.argv[2];
   if (!raw) throw new Error('Missing bridge task payload.');
@@ -23,160 +190,7 @@ async function main() {
     const context = browser.contexts()[0];
     if (!context) throw new Error('No browser context available over CDP.');
 
-    const op = payload.op;
-    let result = {};
-
-    if (op === 'navigate') {
-      const page = await getOrCreatePage(context, Boolean(payload.newWindow));
-      const url = String(payload.url || '');
-      const timeout = normalizeTimeoutMsOrUndefined(payload.timeoutMs);
-      const requested = normalizeLoadState(payload.waitUntil);
-      // Build a fallback chain: requested state -> load -> domcontentloaded.
-      // De-duplicate so we never retry with the same waitUntil twice.
-      const chain = [requested];
-      if (requested !== 'load') chain.push('load');
-      if (requested !== 'domcontentloaded') chain.push('domcontentloaded');
-
-      let lastErr;
-      for (const waitUntil of chain) {
-        try {
-          await page.goto(url, { waitUntil, timeout });
-          lastErr = null;
-          break;
-        } catch (err) {
-          const msg = String(err?.message || '');
-          const isRetriable =
-            msg.includes('Timeout') ||
-            msg.includes('timeout') ||
-            msg.includes('ERR_BLOCKED_BY_RESPONSE') ||
-            msg.includes('net::ERR_');
-          if (!isRetriable || waitUntil === chain[chain.length - 1]) {
-            throw err;
-          }
-          lastErr = err;
-        }
-      }
-      if (lastErr) throw lastErr;
-      // Inject persistent observer after successful navigation so it
-      // starts indexing interactive elements immediately.
-      await ensureObserver(page);
-      result = { ok: true };
-    } else if (op === 'execute') {
-      const page = await getOrCreatePage(context, false);
-      await runExecute(page, payload.action || {});
-      result = { ok: true };
-    } else if (op === 'scanZones') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const zones = await runScanZones(page, payload.zones || [], normalizeCoordinateSpace(payload.coordinateSpace));
-      result = { zones };
-    } else if (op === 'gridScreenshot') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const image = await runGridScreenshot(page, payload.start, payload.end, Boolean(payload.fullPage));
-      result = { imageBase64: image.toString('base64') };
-    } else if (op === 'gridScreenshotText') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const image = await runGridScreenshotText(page, payload.start, payload.end, Boolean(payload.fullPage));
-      result = { imageBase64: image.toString('base64') };
-    } else if (op === 'gridScreenshotInteractive') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const image = await runGridScreenshotInteractive(page, payload.start, payload.end, Boolean(payload.fullPage));
-      result = { imageBase64: image.toString('base64') };
-    } else if (op === 'screenshotText') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const image = await runScreenshotText(page, Boolean(payload.fullPage));
-      result = { imageBase64: image.toString('base64') };
-    } else if (op === 'screenshotInteractive') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const image = await runScreenshotInteractive(page, Boolean(payload.fullPage));
-      result = { imageBase64: image.toString('base64') };
-    } else if (op === 'scanInteractive') {
-      const page = await getOrCreatePage(context, false);
-      // No load-state wait — scanInteractive reads whatever DOM exists right now.
-      // The content is already there; waiting for load/networkidle causes timeouts
-      // on pages with streaming resources.
-      const elements = await runScanInteractive(page);
-      result = { elements };
-    } else if (op === 'screenshot') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const image = await runScreenshot(page, payload.start, payload.end, Boolean(payload.fullPage));
-      result = { imageBase64: image.toString('base64') };
-    } else if (op === 'domQuery') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const elements = await runDomQuery(page, payload);
-      result = { elements };
-    } else if (op === 'findAndClick') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const element = await runDomQueryFirst(page, payload.find);
-      if (!element) {
-        const err = classifyBridgeError(new Error(`findAndClick: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
-        result = { ok: false, element: null, acted: false, error: err };
-      } else {
-        try {
-          await page.click(element.selector);
-          result = { ok: true, element, acted: true };
-        } catch (clickErr) {
-          if (payload.coordinateFallback && element.boundingBox) {
-            try {
-              const coordResult = await coordinateFallbackClick(page, element);
-              result = { ok: true, element, acted: true, coordinatesUsed: coordResult };
-            } catch (fallbackErr) {
-              const err = classifyBridgeError(fallbackErr);
-              result = { ok: false, element, acted: false, error: err };
-            }
-          } else {
-            const err = classifyBridgeError(clickErr);
-            result = { ok: false, element, acted: false, error: err };
-          }
-        }
-      }
-    } else if (op === 'findAndType') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const element = await runDomQueryFirst(page, payload.find);
-      if (!element) {
-        const err = classifyBridgeError(new Error(`findAndType: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
-        result = { ok: false, element: null, acted: false, error: err };
-      } else {
-        try {
-          await atomicSetValue(page, element.selector, String(payload.text || ''));
-          result = { ok: true, element, acted: true };
-        } catch (typeErr) {
-          const err = classifyBridgeError(typeErr);
-          result = { ok: false, element, acted: false, error: err };
-        }
-      }
-    } else if (op === 'findAndSelect') {
-      const page = await getOrCreatePage(context, false);
-      await waitForOptionalLoadState(page, payload.waitUntil, payload.timeoutMs);
-      const element = await runDomQueryFirst(page, payload.find);
-      if (!element) {
-        const err = classifyBridgeError(new Error(`findAndSelect: no element found (mode=${payload.find.mode}, query=${payload.find.query})`));
-        result = { ok: false, element: null, acted: false, error: err };
-      } else {
-        try {
-          await page.selectOption(element.selector, String(payload.value || ''));
-          result = { ok: true, element, acted: true };
-        } catch (selectErr) {
-          const err = classifyBridgeError(selectErr);
-          result = { ok: false, element, acted: false, error: err };
-        }
-      }
-    } else if (op === 'verify') {
-      const page = await getOrCreatePage(context, false);
-      result = await runVerify(page, payload);
-    } else {
-      throw new Error(`Unsupported bridge op: ${String(op)}`);
-    }
-
+    const result = await handleOperation(context, payload);
     process.stdout.write(JSON.stringify(result));
   } finally {
     await browser.close();
@@ -2892,7 +2906,124 @@ async function runDomQueryFirst(page, findPayload) {
   return (elements && elements.length > 0) ? elements[0] : null;
 }
 
-main().catch((error) => {
-  process.stderr.write(String(error && error.stack ? error.stack : error));
-  process.exit(1);
-});
+// ---------------------------------------------------------------------------
+// Sidecar Mode — long-lived IPC-based bridge process
+// ---------------------------------------------------------------------------
+// When launched with --sidecar, the bridge stays alive and receives operations
+// over Node IPC (process.send / process.on('message')). This eliminates
+// per-operation overhead from process spawn, CDP connect, and observer inject.
+// ---------------------------------------------------------------------------
+
+async function startSidecar() {
+  if (typeof process.send !== 'function') {
+    throw new Error('Sidecar mode requires an IPC channel (spawn with stdio "ipc").');
+  }
+
+  // --- Wait for init handshake ---
+  const initMsg = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Sidecar init timeout: no init message within 10s.')), 10_000);
+    const onMessage = (msg) => {
+      if (msg && msg.type === 'init') {
+        clearTimeout(timeout);
+        process.removeListener('message', onMessage);
+        resolve(msg);
+      }
+    };
+    process.on('message', onMessage);
+  });
+
+  const cdpUrl = String(initMsg.cdpUrl || '').trim();
+  if (!cdpUrl) throw new Error('Sidecar init missing cdpUrl.');
+
+  // --- Connect to CDP once ---
+  const version = await fetchJson(`${cdpUrl.replace(/\/$/, '')}/json/version`);
+  const wsEndpoint = version.webSocketDebuggerUrl || cdpUrl;
+  const browser = await chromium.connectOverCDP(wsEndpoint, { timeout: 12000 });
+
+  const context = browser.contexts()[0];
+  if (!context) throw new Error('No browser context available over CDP.');
+
+  // --- Inject observer on the current page and on every future navigation ---
+  const page = await getOrCreatePage(context, false);
+  await ensureObserver(page);
+
+  page.on('framenavigated', async (frame) => {
+    // Only re-inject for the main frame
+    if (frame === page.mainFrame()) {
+      try { await ensureObserver(page); } catch { /* page may be mid-navigation */ }
+    }
+  });
+
+  // --- Lifecycle tracking ---
+  const startedAt = Date.now();
+  let operationCount = 0;
+  let shuttingDown = false;
+
+  // --- Heartbeat every 5s ---
+  const heartbeatInterval = setInterval(() => {
+    try {
+      process.send({ type: 'heartbeat', timestamp: Date.now(), ops: operationCount, uptimeMs: Date.now() - startedAt });
+    } catch { /* parent may have disconnected */ }
+  }, 5_000);
+
+  // --- Serial operation queue (Playwright is not concurrent-safe) ---
+  let opQueue = Promise.resolve();
+
+  function enqueueOperation(id, payload) {
+    opQueue = opQueue.then(async () => {
+      if (shuttingDown) {
+        try { process.send({ id, ok: false, error: { message: 'Sidecar is shutting down.' } }); } catch {}
+        return;
+      }
+      const opStart = Date.now();
+      try {
+        const result = await handleOperation(context, payload);
+        operationCount++;
+        try { process.send({ id, ok: true, result, timing: { durationMs: Date.now() - opStart } }); } catch { /* parent disconnected */ }
+      } catch (err) {
+        try { process.send({ id, ok: false, error: { message: String(err?.message || err), stack: String(err?.stack || '') } }); } catch { /* parent disconnected */ }
+      }
+    });
+  }
+
+  // --- Graceful shutdown ---
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearInterval(heartbeatInterval);
+    try { await browser.close(); } catch { /* already closed */ }
+    process.exit(0);
+  }
+
+  // Parent process disconnected — shut down immediately
+  process.on('disconnect', () => shutdown());
+
+  // --- Listen for IPC operations ---
+  process.on('message', (msg) => {
+    if (!msg || typeof msg !== 'object') return;
+
+    if (msg.op === 'shutdown' || msg.type === 'shutdown') {
+      shutdown();
+      return;
+    }
+
+    // Standard operation message: { id, op, params }
+    if (msg.id && msg.op) {
+      enqueueOperation(msg.id, { op: msg.op, ...msg.params });
+    }
+  });
+
+  // Signal to parent that sidecar is ready
+  process.send({ type: 'ready', timestamp: Date.now() });
+}
+
+// ---------------------------------------------------------------------------
+// Entry point — dual-mode: one-shot (default) or sidecar (--sidecar flag)
+// ---------------------------------------------------------------------------
+
+const isSidecarMode = process.argv.includes('--sidecar');
+if (isSidecarMode) {
+  startSidecar().catch(err => { process.stderr.write(String(err?.stack || err)); process.exit(1); });
+} else {
+  main().catch(err => { process.stderr.write(String(err?.stack || err)); process.exit(1); });
+}

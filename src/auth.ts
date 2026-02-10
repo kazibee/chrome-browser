@@ -10,6 +10,7 @@ export interface Env {
   CHROME_REMOTE_DEBUGGING_PORT?: string;
   CHROME_CDP_URL?: string;
   CHROME_AUTO_LAUNCH?: string;
+  CHROME_USE_SIDECAR?: string;
 }
 
 export interface AuthConfig {
@@ -20,6 +21,7 @@ export interface AuthConfig {
   remoteDebuggingPort: number;
   cdpUrl?: string;
   autoLaunch: boolean;
+  useSidecar: boolean;
 }
 
 export function getAuthConfig(env: Env): AuthConfig {
@@ -31,6 +33,7 @@ export function getAuthConfig(env: Env): AuthConfig {
     remoteDebuggingPort: parsePort(env.CHROME_REMOTE_DEBUGGING_PORT, 9222),
     cdpUrl: env.CHROME_CDP_URL?.trim() || undefined,
     autoLaunch: env.CHROME_AUTO_LAUNCH ? parseBool(env.CHROME_AUTO_LAUNCH) : true,
+    useSidecar: env.CHROME_USE_SIDECAR ? parseBool(env.CHROME_USE_SIDECAR) : true,
   };
 }
 

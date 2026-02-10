@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -311,6 +311,264 @@ interface GeminiResponse {
 
 type LabelsPromptMode = 'full' | 'zone';
 
+// ---------------------------------------------------------------------------
+// Sidecar Manager — persistent bridge process with IPC
+// ---------------------------------------------------------------------------
+
+const SIDECAR_HEARTBEAT_DEAD_MS = 30_000;
+const SIDECAR_MAX_UPTIME_MS = 30 * 60 * 1_000; // 30 minutes
+const SIDECAR_MAX_OPS = 500;
+const SIDECAR_SHUTDOWN_GRACE_MS = 3_000;
+
+interface PendingRequest {
+  resolve: (value: Record<string, unknown>) => void;
+  reject: (reason: unknown) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface QueuedOperation {
+  resolve: (value: Record<string, unknown>) => void;
+  reject: (reason: unknown) => void;
+  op: string;
+  params: Record<string, unknown>;
+}
+
+class SidecarManager {
+  private process: ChildProcess | null = null;
+  private pendingRequests = new Map<string, PendingRequest>();
+  private operationQueue: QueuedOperation[] = [];
+  private processing = false;
+  private cdpUrl = '';
+  private lastHeartbeat = 0;
+  private operationCount = 0;
+  private startedAt = 0;
+  private requestCounter = 0;
+  private shutdownScheduled = false;
+
+  get isRunning(): boolean {
+    return this.process !== null && this.process.exitCode === null && !this.process.killed;
+  }
+
+  async ensureRunning(cdpUrl: string): Promise<void> {
+    this.cdpUrl = cdpUrl;
+
+    if (this.isRunning) return;
+
+    this.shutdownScheduled = false;
+    this.operationCount = 0;
+    this.startedAt = Date.now();
+    this.lastHeartbeat = Date.now();
+
+    const child = spawn('node', [BRIDGE_PATH, '--sidecar'], {
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    this.process = child;
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      process.stderr.write(chunk);
+    });
+
+    child.on('exit', () => {
+      this.handleProcessExit();
+    });
+
+    child.on('message', (msg: unknown) => {
+      this.handleMessage(msg as Record<string, unknown>);
+    });
+
+    // Send init handshake and wait for ready
+    await new Promise<void>((resolve, reject) => {
+      const initTimeout = setTimeout(() => {
+        reject(new Error('Sidecar init handshake timed out after 10s'));
+      }, 10_000);
+
+      const onMessage = (msg: unknown) => {
+        const message = msg as Record<string, unknown>;
+        if (message.type === 'ready') {
+          clearTimeout(initTimeout);
+          child.removeListener('message', onMessage);
+          child.removeListener('exit', onExit);
+          resolve();
+        }
+      };
+
+      const onExit = (code: number | null) => {
+        clearTimeout(initTimeout);
+        child.removeListener('message', onMessage);
+        reject(new Error(`Sidecar exited during init with code ${code}`));
+      };
+
+      child.on('message', onMessage);
+      child.once('exit', onExit);
+
+      child.send({ type: 'init', cdpUrl });
+    });
+  }
+
+  async request(op: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      this.operationQueue.push({ resolve, reject, op, params });
+      this.processQueue();
+    });
+  }
+
+  async shutdown(): Promise<void> {
+    if (!this.isRunning || !this.process) return;
+
+    const child = this.process;
+
+    // Send shutdown message
+    try {
+      child.send({ op: 'shutdown' });
+    } catch {
+      // IPC channel may already be closed
+    }
+
+    // Wait for graceful exit, then force kill
+    await new Promise<void>((resolve) => {
+      const graceTimer = setTimeout(() => {
+        this.forceKill();
+        resolve();
+      }, SIDECAR_SHUTDOWN_GRACE_MS);
+
+      child.once('exit', () => {
+        clearTimeout(graceTimer);
+        resolve();
+      });
+    });
+  }
+
+  forceKill(): void {
+    if (this.process && !this.process.killed) {
+      this.process.kill('SIGKILL');
+    }
+    this.rejectAllPending('Sidecar force-killed');
+    this.process = null;
+  }
+
+  private handleMessage(msg: Record<string, unknown>): void {
+    if (msg.type === 'heartbeat') {
+      this.lastHeartbeat = Date.now();
+      return;
+    }
+
+    const id = msg.id as string | undefined;
+    if (!id) return;
+
+    const pending = this.pendingRequests.get(id);
+    if (!pending) return;
+
+    this.pendingRequests.delete(id);
+    clearTimeout(pending.timer);
+
+    if (msg.ok) {
+      pending.resolve(msg.result as Record<string, unknown> ?? {});
+    } else {
+      const errMsg = (msg.error as Record<string, unknown>)?.message ?? msg.error ?? 'Sidecar operation failed';
+      pending.reject(new Error(String(errMsg)));
+    }
+  }
+
+  private handleProcessExit(): void {
+    this.process = null;
+    this.rejectAllPending('Sidecar process exited unexpectedly');
+    this.processing = false;
+  }
+
+  private rejectAllPending(reason: string): void {
+    for (const [, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
+    }
+    this.pendingRequests.clear();
+
+    // Also reject queued operations
+    const queued = this.operationQueue.splice(0);
+    for (const entry of queued) {
+      entry.reject(new Error(reason));
+    }
+  }
+
+  private processQueue(): void {
+    if (this.processing) return;
+    if (this.operationQueue.length === 0) return;
+
+    this.processing = true;
+    this.drainQueue();
+  }
+
+  private async drainQueue(): Promise<void> {
+    while (this.operationQueue.length > 0) {
+      const entry = this.operationQueue.shift()!;
+
+      // Check heartbeat health before sending
+      if (this.isRunning && this.lastHeartbeat > 0) {
+        const heartbeatAge = Date.now() - this.lastHeartbeat;
+        if (heartbeatAge > SIDECAR_HEARTBEAT_DEAD_MS) {
+          this.forceKill();
+          entry.reject(new Error('Sidecar heartbeat stale — force restarted'));
+          continue;
+        }
+      }
+
+      if (!this.isRunning || !this.process) {
+        entry.reject(new Error('Sidecar is not running'));
+        continue;
+      }
+
+      try {
+        const result = await this.sendRequest(entry.op, entry.params);
+        this.operationCount++;
+        entry.resolve(result);
+      } catch (err) {
+        entry.reject(err);
+      }
+
+      // Check if graceful restart is needed after completing an op
+      if (this.isRunning && !this.shutdownScheduled) {
+        const uptime = Date.now() - this.startedAt;
+        if (uptime >= SIDECAR_MAX_UPTIME_MS || this.operationCount >= SIDECAR_MAX_OPS) {
+          this.shutdownScheduled = true;
+          break; // Stop dequeuing before shutdown
+        }
+      }
+    }
+
+    this.processing = false;
+
+    if (this.shutdownScheduled && this.isRunning) {
+      this.shutdown().catch(() => {});
+    }
+  }
+
+  private sendRequest(op: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      if (!this.process || !this.isRunning) {
+        reject(new Error('Sidecar is not running'));
+        return;
+      }
+
+      const id = `req-${++this.requestCounter}`;
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Sidecar request timed out after ${BRIDGE_TIMEOUT_MS}ms (op: ${op})`));
+      }, BRIDGE_TIMEOUT_MS);
+
+      this.pendingRequests.set(id, { resolve, reject, timer });
+
+      try {
+        this.process.send({ id, op, params });
+      } catch (err) {
+        this.pendingRequests.delete(id);
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  }
+}
+
+const sidecarManager = new SidecarManager();
+
 export function createChromeBrowserClient(config: AuthConfig) {
   return {
     /** Returns the configured Chrome executable path. */
@@ -577,6 +835,8 @@ export function createChromeBrowserClient(config: AuthConfig) {
      * bridge op internally. Supports coordinate fallback and verification.
      */
     atomicSubmit: async (options: AtomicSubmitOptions): Promise<ActionResult> => atomicSubmit(config, options),
+    /** Gracefully shuts down the persistent sidecar bridge process, if running. */
+    shutdown: (): Promise<void> => sidecarManager.shutdown(),
   };
 }
 
@@ -1738,8 +1998,26 @@ async function waitForCdp(cdpUrl: string, timeoutMs: number): Promise<boolean> {
 }
 
 async function runBridge(config: AuthConfig, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const cdpUrl = getCdpUrl(config);
+  const op = typeof payload.op === 'string' ? payload.op : 'unknown';
+
+  if (config.useSidecar) {
+    try {
+      await sidecarManager.ensureRunning(cdpUrl);
+      return await sidecarManager.request(op, payload);
+    } catch {
+      // Sidecar failed — fall through to spawn-per-op
+      process.stderr.write(`[chrome-browser] Sidecar failed for op "${op}", falling back to spawn-per-op\n`);
+    }
+  }
+
+  return runBridgeSpawn(cdpUrl, payload);
+}
+
+/** Spawn-per-operation bridge invocation (original path). */
+function runBridgeSpawn(cdpUrl: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   const task = {
-    cdpUrl: getCdpUrl(config),
+    cdpUrl,
     payload,
   };
 
@@ -1766,11 +2044,11 @@ async function runBridge(config: AuthConfig, payload: Record<string, unknown>): 
       handler();
     };
 
-    child.stdout.on('data', (chunk) => {
+    child.stdout.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
     });
 
-    child.stderr.on('data', (chunk) => {
+    child.stderr.on('data', (chunk: Buffer) => {
       stderr += chunk.toString();
     });
 
