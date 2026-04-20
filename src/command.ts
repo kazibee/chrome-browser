@@ -77,21 +77,39 @@ export async function screenshot(first?: string | string[], ...rest: string[]) {
   } as CommandResult<typeof result>;
 }
 
-export async function view(first?: string | string[], ...rest: string[]) {
-  const args = normalizeArgs(first, rest);
-  const [outputPath, start, end] = args;
-  if (!outputPath) {
-    throw new Error('Usage: kazibee chrome-browser view <outputPath> [startCell endCell]');
+export async function view() {
+  const env = process.env as Env;
+  const port = env.CHROME_REMOTE_DEBUGGING_PORT?.trim() || '9222';
+  const cdpUrl = env.CHROME_CDP_URL?.trim() || `http://127.0.0.1:${port}`;
+  const base = cdpUrl.replace(/\/$/, '');
+
+  // Check reachability without launching a daemon
+  let connected = false;
+  try {
+    const res = await fetch(`${base}/json/version`);
+    connected = res.ok;
+  } catch {
+    connected = false;
   }
 
-  const client = main(process.env as Env);
-  const result =
-    start && end ? await client.saveScreenshot(outputPath, { start, end }) : await client.saveScreenshot(outputPath);
+  if (!connected) {
+    console.log('Browser: not connected');
+    return;
+  }
 
-  return {
-    ok: true,
-    result,
-  } as CommandResult<typeof result>;
+  // Fetch open tabs
+  const res = await fetch(`${base}/json`);
+  const targets = (await res.json()) as Array<Record<string, unknown>>;
+  const pages = targets.filter((t) => t.type === 'page');
+
+  console.log('Browser: connected');
+  console.log(`Tabs: ${pages.length}`);
+
+  if (pages.length > 0) {
+    const active = pages[0];
+    console.log(`URL: ${active.url}`);
+    console.log(`Title: ${active.title}`);
+  }
 }
 
 export async function labels(first?: string | string[], ...rest: string[]) {
@@ -148,7 +166,7 @@ export async function help(): Promise<CommandHelp> {
       'kazibee chrome-browser open <url> [--new-window]',
       'kazibee chrome-browser tabs',
       'kazibee chrome-browser screenshot <outputPath> [startCell endCell]',
-      'kazibee chrome-browser view <outputPath> [startCell endCell]',
+      'kazibee chrome-browser view',
       'kazibee chrome-browser labels [model]',
       'kazibee chrome-browser find <query> [--model <model>]',
       'All browser operations are CDP-backed; no non-CDP mode is supported.',

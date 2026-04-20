@@ -1174,13 +1174,25 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 };
  * Ensures the page has a non-zero viewport. CDP-connected pages (about:blank,
  * minimized windows, headless with no viewport) can report 0x0, which causes
  * Playwright's screenshot to fail with "Cannot take screenshot with 0 width."
+ *
+ * When connecting over CDP, page.viewportSize() returns null because Playwright
+ * didn't set a viewport — but the browser may have a perfectly valid window.
+ * We check actual CSS dimensions to avoid overriding the browser's natural layout.
  * @param {import('playwright').Page} page
  */
 async function ensureViewportSize(page) {
   const size = page.viewportSize();
-  if (!size || size.width <= 0 || size.height <= 0) {
-    await page.setViewportSize(DEFAULT_VIEWPORT);
-  }
+  if (size && size.width > 0 && size.height > 0) return;
+
+  // viewportSize() is null or 0x0 — check actual CSS dimensions before overriding
+  const css = await page.evaluate(() => ({
+    width: window.innerWidth || 0,
+    height: window.innerHeight || 0,
+  }));
+
+  if (css.width > 0 && css.height > 0) return;
+
+  await page.setViewportSize(DEFAULT_VIEWPORT);
 }
 
 /**

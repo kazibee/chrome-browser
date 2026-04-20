@@ -793,49 +793,107 @@ export function createChromeBrowserClient(config: AuthConfig) {
     execute: async (action: Action): Promise<void> => execute(config, action),
     /**
      * Atomically finds an element and clicks it in a single bridge invocation.
-     * Eliminates the 200-600ms gap between separate find and execute calls,
-     * preventing element detachment on high-churn SPA pages.
+     * Use instead of separate findBy*() + execute() when the page has moderate
+     * DOM churn that can cause element detachment between calls.
+     *
+     * @param find - Element query: { mode: 'selector'|'role'|'label'|'text', query: string }
+     * @param options - Wait strategy options (waitUntil, timeoutMs)
+     * @returns FindAndActResult with the found element info and whether the click succeeded
+     *
+     * For high-churn pages needing retries/verification, use atomicClick() instead.
      */
     findAndClick: async (find: FindQuery, options?: FindAndClickOptions): Promise<FindAndActResult> =>
       findAndClick(config, find, options),
     /**
      * Atomically finds an element and types text into it in a single bridge invocation.
      * Uses native value setter to bypass React's interceptor, dispatching input+change events.
-     * Eliminates the inter-bridge gap that causes detachment on high-churn pages.
+     * Use instead of separate findBy*() + execute(type) when the page has moderate DOM churn.
+     *
+     * @param find - Element query: { mode: 'selector'|'role'|'label'|'text', query: string }
+     * @param text - Text to type into the found element
+     * @param options - Wait strategy options (waitUntil, timeoutMs)
+     * @returns FindAndActResult with the found element info and whether the type succeeded
+     *
+     * For high-churn pages needing retries/verification, use atomicType() instead.
      */
     findAndType: async (find: FindQuery, text: string, options?: FindAndTypeOptions): Promise<FindAndActResult> =>
       findAndType(config, find, text, options),
     /**
      * Atomically finds a select element and sets its value in a single bridge invocation.
-     * Eliminates the inter-bridge gap that causes detachment on high-churn pages.
+     * Use instead of separate findBy*() + execute(select) when the page has moderate DOM churn.
+     *
+     * @param find - Element query: { mode: 'selector'|'role'|'label'|'text', query: string }
+     * @param value - Option value to select
+     * @param options - Wait strategy options (waitUntil, timeoutMs)
+     * @returns FindAndActResult with the found element info and whether the select succeeded
+     *
+     * For high-churn pages needing retries/verification, use atomicSelect() instead.
      */
     findAndSelect: async (find: FindQuery, value: string, options?: FindAndSelectOptions): Promise<FindAndActResult> =>
       findAndSelect(config, find, value, options),
     /**
      * Resilient click with composable Target + Verify + Resilience.
-     * Performs find-and-click in a single bridge invocation with configurable
-     * retry orchestration, coordinate fallback, and post-action verification.
+     * Finds and clicks an element atomically with configurable retry orchestration,
+     * coordinate-based fallback, and post-action verification.
+     *
+     * Use when: page has high DOM churn, action reliability is critical, or you
+     * need post-action verification (e.g., URL changed, element appeared/disappeared).
+     *
+     * @param options.target - How to find the element (by selector, role, label, text, or point)
+     * @param options.verify - Optional post-action assertion (urlContains, textAppears, selectorGone, etc.)
+     * @param options.resilience - Optional retry strategy (retries, coordinateFallback, timeoutMs, retryDelay)
+     * @returns ActionResult with ok, attempts, durationMs, findResult, verification, error
      */
     atomicClick: async (options: AtomicClickOptions): Promise<ActionResult> => atomicClick(config, options),
     /**
      * Resilient type with composable Target + Verify + Resilience.
-     * Performs find-and-type in a single bridge invocation using native value
-     * setters (React-safe) with configurable retry and verification.
+     * Finds and types into an element atomically using native value setters
+     * (React-safe) with configurable retry orchestration and post-action verification.
+     *
+     * Use when: page has high DOM churn, form fields re-render frequently, or you
+     * need post-action verification that the text was accepted.
+     *
+     * @param options.target - How to find the element (by selector, role, label, text, or point)
+     * @param options.text - Text to type into the found element
+     * @param options.verify - Optional post-action assertion
+     * @param options.resilience - Optional retry strategy (retries, coordinateFallback, timeoutMs, retryDelay)
+     * @returns ActionResult with ok, attempts, durationMs, findResult, verification, error
      */
     atomicType: async (options: AtomicTypeOptions): Promise<ActionResult> => atomicType(config, options),
     /**
      * Resilient select with composable Target + Verify + Resilience.
-     * Performs find-and-select in a single bridge invocation with configurable
+     * Finds a select element and sets its value atomically with configurable
      * retry orchestration and post-action verification.
+     *
+     * Use when: page has high DOM churn or select elements are dynamically rendered.
+     *
+     * @param options.target - How to find the select element (by selector, role, label, text, or point)
+     * @param options.value - Option value to select
+     * @param options.verify - Optional post-action assertion
+     * @param options.resilience - Optional retry strategy (retries, coordinateFallback, timeoutMs, retryDelay)
+     * @returns ActionResult with ok, attempts, durationMs, findResult, verification, error
      */
     atomicSelect: async (options: AtomicSelectOptions): Promise<ActionResult> => atomicSelect(config, options),
     /**
      * Resilient form submission with composable Target + Verify + Resilience.
-     * Finds the submit target and clicks it atomically. Uses findAndClick
-     * bridge op internally. Supports coordinate fallback and verification.
+     * Finds the submit target and clicks it atomically with retry orchestration
+     * and post-action verification (e.g., URL changed after submit).
+     *
+     * Use when: form submission is critical and you need to verify the result,
+     * or the submit button is in a high-churn area of the page.
+     *
+     * @param options.target - How to find the submit element (by selector, role, label, text, or point)
+     * @param options.verify - Optional post-action assertion (urlContains, textAppears, etc.)
+     * @param options.resilience - Optional retry strategy (retries, coordinateFallback, timeoutMs, retryDelay)
+     * @returns ActionResult with ok, attempts, durationMs, findResult, verification, error
      */
     atomicSubmit: async (options: AtomicSubmitOptions): Promise<ActionResult> => atomicSubmit(config, options),
-    /** Gracefully shuts down the persistent sidecar bridge process, if running. */
+    /**
+     * Gracefully shuts down the persistent sidecar bridge process.
+     * Call when done with all browser operations to release resources.
+     * Safe to call multiple times or when no sidecar is running (no-op).
+     * The sidecar auto-restarts on the next operation if needed.
+     */
     shutdown: (): Promise<void> => sidecarManager.shutdown(),
   };
 }

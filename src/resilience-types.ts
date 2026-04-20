@@ -1,3 +1,14 @@
+/**
+ * Composable resilience types for atomic browser actions.
+ *
+ * Target — HOW to find the element (by: selector | role | label | text | point)
+ * Verify — WHAT to assert after acting (urlContains | textAppears | selectorGone | ...)
+ * Resilience — HOW to retry on failure (retries, coordinateFallback, timeoutMs, retryDelay)
+ * ActionResult — WHAT happened (ok, attempts, durationMs, findResult, verification, error)
+ *
+ * Used by atomicClick, atomicType, atomicSelect, atomicSubmit.
+ */
+
 import type { BoundingBox, GridRange, NavigationWaitOptions, SelectorWaitState } from './chrome-client';
 
 // ---------------------------------------------------------------------------
@@ -39,6 +50,7 @@ export interface TargetByPoint {
   y: number;
 }
 
+/** Which element to act on. Discriminated by the `by` field. */
 export type Target =
   | TargetBySelector
   | TargetByRole
@@ -95,6 +107,7 @@ export interface VerifyCustom {
   timeoutMs?: number;
 }
 
+/** Post-action assertion. Discriminated by the `type` field. All variants support `timeoutMs`. */
 export type Verify =
   | VerifyUrlContains
   | VerifyUrlMatches
@@ -133,6 +146,7 @@ export type RetryDelayStrategy =
 // Resilience — retry/fallback strategy
 // ---------------------------------------------------------------------------
 
+/** Retry and fallback strategy. All fields optional — defaults to 1 attempt, no fallback. */
 export interface Resilience {
   retries?: number;
   coordinateFallback?: boolean;
@@ -196,6 +210,7 @@ export interface VerificationResult {
   durationMs: number;
 }
 
+/** Structured result from atomic operations. Check `ok` first, then `verification?.passed` if verify was specified. */
 export interface ActionResult {
   ok: boolean;
   attempts: number;

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html style="zoom: 1.5;">
+<head>
+  <title>CSS Zoom Detection Test</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      zoom: 0.8;
+    }
+
+    #test-fixed {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      width: 100px;
+      height: 50px;
+      background: red;
+    }
+
+    #test-sticky {
+      position: sticky;
+      top: 0;
+      width: 200px;
+      height: 50px;
+      background: blue;
+    }
+
+    #test-normal {
+      position: relative;
+      margin-top: 100px;
+      width: 150px;
+      height: 50px;
+      background: green;
+    }
+
+    #test-scaled {
+      transform: scale(0.5);
+      width: 200px;
+      height: 100px;
+      background: orange;
+      margin-top: 50px;
+    }
+  </style>
+</head>
+<body>
+  <h1>CSS Zoom & Position Detection Tests</h1>
+
+  <div id="test-fixed">Fixed</div>
+  <div id="test-sticky">Sticky</div>
+  <div id="test-normal">Normal</div>
+  <div id="test-scaled">Scaled</div>
+
+  <script>
+    // Test 1: CSS Zoom Detection
+    console.log("=== CSS ZOOM DETECTION ===");
+
+    const htmlZoom = window.getComputedStyle(document.documentElement).zoom;
+    const bodyZoom = window.getComputedStyle(document.body).zoom;
+
+    console.log("HTML zoom (getComputedStyle):", htmlZoom);
+    console.log("Body zoom (getComputedStyle):", bodyZoom);
+    console.log("window.devicePixelRatio:", window.devicePixelRatio);
+
+    // Effective zoom is multiplicative
+    const effectiveZoom = parseFloat(htmlZoom || 1) * parseFloat(bodyZoom || 1);
+    console.log("Effective zoom (html * body):", effectiveZoom);
+
+    // Test 2: Position Detection
+    console.log("\n=== POSITION DETECTION ===");
+
+    const elements = [
+      { id: 'test-fixed', expected: 'fixed' },
+      { id: 'test-sticky', expected: 'sticky' },
+      { id: 'test-normal', expected: 'relative' },
+      { id: 'test-scaled', expected: 'static' }
+    ];
+
+    elements.forEach(({ id, expected }) => {
+      const el = document.getElementById(id);
+      const computedPosition = window.getComputedStyle(el).position;
+      console.log(`#${id}: position="${computedPosition}" (expected: ${expected})`);
+    });
+
+    // Test 3: getBoundingClientRect with zoom
+    console.log("\n=== BOUNDING RECT WITH ZOOM ===");
+
+    const normalEl = document.getElementById('test-normal');
+    const rect = normalEl.getBoundingClientRect();
+    console.log("Normal element rect:", {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height
+    });
+    console.log("Rect values are AFTER zoom is applied");
+
+    // Test 4: Viewport dimensions
+    console.log("\n=== VIEWPORT DIMENSIONS ===");
+    console.log("window.innerWidth:", window.innerWidth);
+    console.log("window.innerHeight:", window.innerHeight);
+    console.log("These are BEFORE body zoom, AFTER html zoom");
+
+    // Test 5: ScrollX/Y with fixed element
+    console.log("\n=== SCROLL ADJUSTMENT TEST ===");
+    window.scrollTo(0, 500);
+
+    setTimeout(() => {
+      const fixedEl = document.getElementById('test-fixed');
+      const fixedRect = fixedEl.getBoundingClientRect();
+
+      console.log("After scroll to Y=500:");
+      console.log("Fixed element rect.top:", fixedRect.top, "(should still be 10)");
+      console.log("window.scrollY:", window.scrollY);
+      console.log("If we add scrollY to fixed element, coordinate would be WRONG:", fixedRect.top + window.scrollY);
+
+      const normalEl2 = document.getElementById('test-normal');
+      const normalRect2 = normalEl2.getBoundingClientRect();
+      console.log("Normal element rect.top:", normalRect2.top);
+      console.log("Adding scrollY to normal element:", normalRect2.top + window.scrollY, "(correct for page space)");
+    }, 100);
+
+    // Test 6: Transform detection
+    console.log("\n=== TRANSFORM DETECTION ===");
+    const scaledEl = document.getElementById('test-scaled');
+    const transform = window.getComputedStyle(scaledEl).transform;
+    console.log("Scaled element transform:", transform);
+    console.log("Transform is a matrix, needs parsing to detect scale");
+  </script>
+
+  <div style="height: 2000px; padding-top: 50px;">
+    <p>Scroll down to test position:fixed behavior...</p>
+  </div>
+</body>
+</html>

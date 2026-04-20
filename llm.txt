@@ -14,6 +14,16 @@ Optional env configuration
 - CHROME_REMOTE_DEBUGGING_PORT
 - CHROME_CDP_URL
 - CHROME_AUTO_LAUNCH
+- CHROME_USE_SIDECAR
+
+CLI commands (run directly, no `kazibee exec` needed)
+- `kazibee chrome-browser view` — current browser state (connected?, URL, title). ALWAYS run first.
+- `kazibee chrome-browser launch` — start Chrome daemon
+- `kazibee chrome-browser open <url> [--new-window]` — navigate to URL
+- `kazibee chrome-browser tabs` — list all open tabs
+- `kazibee chrome-browser screenshot <path> [startCell endCell]` — save grid screenshot
+- `kazibee chrome-browser labels [model]` — Gemini vision labeling
+- `kazibee chrome-browser find <query> [--model <model>]` — find interactive element by natural language
 
 Runtime model
 - Tool ensures one persistent Chrome daemon with CDP.
@@ -32,6 +42,8 @@ Runtime model
   with an `id`, then builds a child-combinator path down (e.g. `div#login-form > div:nth-of-type(2) > button`).
   Pairs with `gridScreenshotInteractive()` — the image shows WHERE controls are, this query returns
   WHAT they are with selectors ready for `execute()`. Faster than Gemini vision for getting the action space.
+- `shutdown()` releases the persistent sidecar bridge process. Call when done with all browser operations.
+- Sidecar is enabled by default — operations route through a long-lived IPC bridge process for ~98% lower per-op latency. Falls back to spawn-per-op automatically on failure. Transparent to callers.
 - `execute` click/type/select/submit actions require `selector`.
 - `execute` `click` and `submit` also support `waitForNavigation`:
   - `true` for default wait
@@ -78,14 +90,100 @@ Clean screenshots without grid overlay:
 - findBySelector, findByRole, findByLabel, findByText
 
 ### Action tools (interacting with the page)
-- execute, open, launch, launchDaemon
+- execute — simple actions with known CSS selectors (Tier 1)
+- findAndClick, findAndType, findAndSelect — atomic find+act (Tier 2)
+- atomicClick, atomicType, atomicSelect, atomicSubmit — resilient actions with retry/verify (Tier 3)
+- open, launch, launchDaemon, shutdown
 
 NEVER use gridScreenshot or saveGridScreenshot when the goal is to show the user what a page looks like. Use screenshot/saveScreenshot instead.
+
+## Browser State Rule (CRITICAL)
+
+ALWAYS check the current browser state BEFORE any browser operation:
+```bash
+kazibee chrome-browser view
+```
+
+This returns the current connection status, active tab URL, and title — WITHOUT launching
+or navigating. Use this to decide your next action:
+
+- **Browser: not connected** → call `launchDaemon()` then `open(url)`
+- **Browser: connected, URL already matches target** → skip `open()`, interact directly
+- **Browser: connected, URL is different** → call `open(url)` to navigate
+
+DO NOT blindly call `launchDaemon()` + `open()` every time. The browser may already be on
+the correct page from a previous step. Navigating away loses the user's current context.
+
+## ACTION API TIERS
+
+Three tiers of action APIs, from simplest to most resilient. Choose the lowest
+tier that meets your needs — simpler APIs have less overhead.
+
+### Tier 1: `execute()` — Simple, fire-and-forget actions
+- Use when: page is stable, you already have the CSS selector, no verification needed
+- Best for: Static pages, server-rendered HTML, known selectors from `scanInteractive()`
+- Pattern: `scanInteractive()` → pick selector → `execute({ type: 'click', selector })`
+
+### Tier 2: `findAndClick/Type/Select` — Atomic find+act
+- Use when: you need to find and act in a single bridge call to avoid element detachment
+- Best for: SPAs with moderate churn, when you have a query but not a pre-resolved selector
+- Pattern: `findAndClick({ mode: 'role', query: 'button' })`
+- Returns: `FindAndActResult` — the found element + whether the action succeeded
+
+### Tier 3: `atomicClick/Type/Select/Submit` — Full resilience
+- Use when: page has high DOM churn, actions are flaky, you need post-action verification
+- Best for: Real-time dashboards, chat apps, infinite scroll, aggressive SPA re-rendering
+- Pattern: `atomicClick({ target: { by: 'role', role: 'button', name: 'Submit' }, verify: { type: 'urlContains', value: '/success' }, resilience: { retries: 3, coordinateFallback: true } })`
+- Returns: `ActionResult` — structured ok/attempts/durationMs/findResult/verification/error
+
+### Decision rule
+```
+Page is static or you have a known selector? → execute()
+Need atomic find+act but page is manageable?  → findAndClick/Type/Select
+Page is high-churn or action is critical?      → atomicClick/Type/Select/Submit
+```
+
+## COMPOSABLE RESILIENCE API
+
+The Tier 3 atomic* methods accept composable Target + Verify + Resilience options.
+
+### Target — how to find the element
+- `{ by: 'selector', selector: '#submit-btn' }` — direct CSS selector
+- `{ by: 'role', role: 'button', name: 'Submit' }` — ARIA role query
+- `{ by: 'label', labelText: 'Email' }` — form label query
+- `{ by: 'text', text: 'Sign In', tag: 'button' }` — visible text query
+- `{ by: 'point', x: 150, y: 300 }` — coordinate click (last resort)
+
+### Verify — post-action assertion (optional)
+- `{ type: 'urlContains', value: '/dashboard' }` — URL changed
+- `{ type: 'textAppears', text: 'Welcome' }` — text appeared
+- `{ type: 'selectorGone', selector: '.modal' }` — element disappeared
+- `{ type: 'selectorAppears', selector: '.success-message' }` — element appeared
+
+### Resilience — retry strategy (optional)
+- `retries: 3` — max attempts
+- `coordinateFallback: true` — fall back to coordinate click if selector click fails
+- `timeoutMs: 10000` — overall timeout across all retries
+- `retryDelay: { type: 'exponential', baseMs: 100 }` — backoff between retries
+
+### ActionResult — structured return
+- `ok: boolean` — whether the action succeeded
+- `attempts: number` — how many tries it took
+- `verification?: { passed, message }` — post-action check result
+- `error?: { tier, code, message }` — classified error if failed
 
 ## PAGE INTERACTION WORKFLOW (MANDATORY)
 
 When you need to interact with a page (click, type, fill forms, navigate), ALWAYS
-follow this 3-step sequence. Each step only runs if the previous one was insufficient.
+follow this sequence. Each step only runs if the previous one was insufficient.
+
+### Step 0: `kazibee chrome-browser view` — "Where am I?" (Browser State)
+ALWAYS run this FIRST, BEFORE any `kazibee exec` call. This is a CLI command, not JS code.
+It tells you whether the browser is connected and what page is currently loaded.
+
+- **Browser: not connected** → you need `launchDaemon()` + `open(url)`
+- **URL already matches your target** → skip navigation, go to Step 1
+- **URL is different** → call `open(url)` to navigate, then Step 1
 
 ### Step 1: scanInteractive() — "What can I do?" (Structured Data)
 ALWAYS call `scanInteractive()` FIRST. This returns every interactive element on
@@ -97,6 +195,8 @@ no vision model, instant results.
 - Covers: buttons, links, inputs, selects, textareas, ARIA controls, cursor:pointer elements
 
 **If scanInteractive gives you the selector you need → go straight to execute(). DONE.**
+
+> **If `execute()` fails with element detachment or stale element errors**, do NOT retry with the same `execute()` call. The page likely has high DOM churn. Escalate to `findAndClick/Type/Select` (Tier 2) or `atomicClick/Type/Select` (Tier 3) which handle re-finding and retrying atomically.
 
 ### Step 2: gridScreenshotInteractive() — "Where are the controls?" (Visual Map)
 Call ONLY if Step 1 results are ambiguous — multiple similar elements, unclear which
@@ -124,6 +224,13 @@ Call ONLY if Steps 1 and 2 were not enough — you need surrounding page context
 - Vision APIs (labels, labelsOverview) are for content understanding, NOT for finding things to click.
 
 ### Workflow Example
+```bash
+# Step 0: Check browser state (CLI command — before any kazibee exec)
+kazibee chrome-browser view
+# Output: Browser: connected | URL: https://example.com/login | Title: Login Page
+# → Already on the login page, skip open(). Go to Step 1.
+```
+
 ```ts
 // Step 1: Get structured action space
 const elements = await tools["chrome-browser"].scanInteractive();
@@ -140,6 +247,19 @@ if (loginBtn) {
   // Step 3: Full context (only if still unclear)
   const fullView = await tools["chrome-browser"].gridScreenshotBase64();
   // Now you can see text labels, layout, and controls together
+}
+```
+
+### Atomic Workflow Example (for high-churn pages)
+```ts
+// For high-churn pages — resilient atomic action
+const result = await tools["chrome-browser"].atomicClick({
+  target: { by: 'role', role: 'button', name: /log.?in|sign.?in/i },
+  verify: { type: 'urlContains', value: '/dashboard' },
+  resilience: { retries: 3, coordinateFallback: true, timeoutMs: 10000 }
+});
+if (!result.ok) {
+  // result.error has { tier, code, message } for diagnostics
 }
 ```
 
@@ -276,6 +396,11 @@ DO NOT take a full-page screenshot when a gridRange is available — crop to the
 
 Typical intents to map
 
+### Browser State (ALWAYS FIRST)
+- "check browser" -> `kazibee chrome-browser view` (CLI command, not JS)
+- "what page am I on" -> `kazibee chrome-browser view`
+- "is browser running" -> `kazibee chrome-browser view`
+
 ### DOM-First Queries (PREFERRED - 360x faster)
 - "find button by ID/class" -> findBySelector('#submit-btn') [0.1s, Tier 1]
 - "find submit button" -> findByRole('button', { name: 'Submit' }) [0.5s, Tier 2]
@@ -307,6 +432,14 @@ Typical intents to map
 - "wait for initial page readiness" -> execute({ type: "waitForLoadState", state: "domcontentloaded" })
 - "wait for control visibility" -> execute({ type: "waitForSelector", selector, state: "visible" })
 - "scroll to element" -> execute({ type: "scrollIntoView", selector })
+
+### Resilient Actions (for dynamic/flaky pages)
+- "click reliably" -> atomicClick({ target: { by: 'role', role: 'button', name: '...' } })
+- "type into flaky input" -> atomicType({ target: { by: 'label', labelText: '...' }, text: '...' })
+- "submit and verify" -> atomicSubmit({ target: ..., verify: { type: 'urlContains', value: '...' } })
+- "click with retry" -> atomicClick({ target: ..., resilience: { retries: 3 } })
+- "click with coordinate fallback" -> atomicClick({ target: ..., resilience: { coordinateFallback: true } })
+- "done with browser" -> shutdown()
 
 ### Observation & Review (user-facing — use clean screenshots)
 - "look at the page" -> screenshot()
@@ -372,6 +505,11 @@ Use for:
 
 ```
 Need to INTERACT with something (click, type, submit)?
+  │
+  ├─ Step 0: kazibee chrome-browser view [CLI — check state first]
+  │   Browser not connected? → launchDaemon() + open(url)
+  │   Already on target page? → skip open(), go to Step 1
+  │   On wrong page? → open(url), then Step 1
   │
   ├─ Step 1: scanInteractive() [instant — ALWAYS start here]
   │   Found target selector? → execute() — DONE
@@ -829,7 +967,56 @@ if (!signUp) {
 await tools["chrome-browser"].execute({ type: "click", selector: signUp.selector });
 ```
 
+### Example 4: Resilient Form Fill on Dynamic Page
+```ts
+// Example 4: Resilient form fill on a high-churn SPA
+await tools["chrome-browser"].launchDaemon();
+await tools["chrome-browser"].open("https://dynamic-app.com/signup");
+
+// Type email — atomic with retry for pages that re-render rapidly
+const emailResult = await tools["chrome-browser"].atomicType({
+  target: { by: 'label', labelText: /email/i },
+  text: "user@example.com",
+  resilience: { retries: 2, timeoutMs: 5000 }
+});
+
+// Type password
+await tools["chrome-browser"].atomicType({
+  target: { by: 'label', labelText: /password/i },
+  text: "securepass123",
+  resilience: { retries: 2 }
+});
+
+// Submit with verification
+const submitResult = await tools["chrome-browser"].atomicSubmit({
+  target: { by: 'role', role: 'button', name: /sign up|register/i },
+  verify: { type: 'urlContains', value: '/welcome', timeoutMs: 5000 },
+  resilience: { retries: 3, coordinateFallback: true, timeoutMs: 15000 }
+});
+
+if (!submitResult.ok) {
+  throw new Error(`Submit failed: ${submitResult.error?.message} (${submitResult.error?.code})`);
+}
+
+// Clean up
+await tools["chrome-browser"].shutdown();
+```
+
 ## MANDATORY: Mini-Call Mode (Kazibee) - AGGRESSIVE BATCHING
+
+### chrome-browser API — Common Mistakes
+Only call methods that exist on `tools["chrome-browser"]`. Do NOT invent methods.
+
+```
+WRONG → browser.goto(url)              CORRECT → browser.open(url)
+WRONG → browser.getText(selector)      CORRECT → browser.findByText(pattern)
+WRONG → browser.waitForSelector(sel)   CORRECT → browser.execute({ type: "waitForSelector", selector, state })
+WRONG → browser.launch({ headless })   CORRECT → browser.launchDaemon()
+WRONG → browser.navigate(url)          CORRECT → browser.open(url)
+WRONG → browser.press(selector, key)   CORRECT → browser.execute({ type: "type", selector, text })
+```
+
+Refer to `kazibee llm` (global guide) for heredoc, incremental calls, and API accuracy rules.
 
 When using `kazibee exec`, batch related operations within safety constraints.
 
@@ -902,3 +1089,5 @@ execute([
 - Result for each operation
 - Overall success/failure
 - Next planned step (separate call)
+
+**Note:** atomic* methods (atomicClick, atomicType, atomicSelect, atomicSubmit) handle their own retry orchestration internally. Do NOT wrap them in manual retry loops. The `resilience` option handles retries, delays, and timeout. Only use batching with `execute()` (Tier 1).
